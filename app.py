@@ -6,7 +6,7 @@ import requests
 import streamlit as st
 
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
 
 # -----------------------------
 # Page Config
@@ -132,14 +132,14 @@ def summarize_matches_for_csv(top_matches: list[dict]) -> dict:
 # -----------------------------
 # Google Sheets helpers
 # -----------------------------
-GOOGLE_SHEET_ID = "1E5Sq2M1vcC-A70aCUSfY8FFXUdooUw6LGRptmqUrwSM"
+GOOGLE_SHEET_ID = _get_secret("1E5Sq2M1vcC-A70aCUSfY8FFXUdooUw6LGRptmqUrwSM")
 
-def sheets_client():
-    # Pull from TOML table and normalize types to plain strings
+def _google_creds():
+    # Read TOML table and normalize to plain strings
     sa_raw = st.secrets["google_service_account"]
     sa_info = {k: ("" if sa_raw[k] is None else str(sa_raw[k])) for k in sa_raw.keys()}
 
-    # Normalize private key newlines (handles either PEM multiline or \n-escaped)
+    # Normalize newlines if someone pasted \n escapes
     pk = sa_info.get("private_key", "")
     if "\\n" in pk:
         pk = pk.replace("\\n", "\n")
@@ -149,24 +149,29 @@ def sheets_client():
         sa_info,
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
-
-    # cache_discovery=False avoids file/seek issues in hosted environments (Streamlit Cloud)
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return creds
 
 def append_row(tab_name: str, row_values: list):
-    svc = sheets_client()
+    creds = _google_creds()
+    creds.refresh(Request())
+    token = creds.token
 
-    # Ensure no None values get sent to Sheets
     safe_values = ["" if v is None else str(v) for v in row_values]
 
-    svc.spreadsheets().values().append(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"{tab_name}!A:Z",
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body={"values": [safe_values]},
-    ).execute()
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{tab_name}!A:Z:append"
+    params = {
+        "valueInputOption": "USER_ENTERED",
+        "insertDataOption": "INSERT_ROWS",
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    body = {"values": [safe_values]}
 
+    resp = requests.post(url, params=params, headers=headers, json=body, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
 
 def export_to_google_sheets(results: dict):
     trace = results.get("traceability", {})
@@ -176,7 +181,7 @@ def export_to_google_sheets(results: dict):
 
     matches = trace.get("search_summary", {}).get("top_matches", [])
 
-    # MVP heuristic split
+    # MVP heuristic split (same as before)
     auction = [m for m in matches if "auction" in (m.get("source","").lower())]
     retail = [m for m in matches if m not in auction]
 
