@@ -1,9 +1,25 @@
 import os
 import uuid
 from datetime import datetime
-
 import boto3
 import streamlit as st
+import requests
+
+def serpapi_google_lens_search(image_url: str) -> dict:
+    api_key = _get_secret("SERPAPI_API_KEY")
+    params = {
+        "engine": "google_lens",
+        "url": image_url,
+        "api_key": api_key,
+    }
+    resp = requests.get(
+        "https://serpapi.com/search.json",
+        params=params,
+        timeout=60
+    )
+    resp.raise_for_status()
+    return resp.json()
+
 
 # -----------------------------
 # Page Config
@@ -120,23 +136,33 @@ if uploaded_file is not None:
 # -----------------------------
 # 2. Run Appraisal
 # -----------------------------
+def serpapi_google_lens_search(image_url: str) -> dict:
+    api_key = _get_secret("SERPAPI_API_KEY")
+    params = {"engine": "google_lens", "url": image_url, "api_key": api_key}
+    resp = requests.get("https://serpapi.com/search.json", params=params, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
 st.header("2. Run Appraisal")
 
 run_disabled = not st.session_state.image_uploaded
 
 if st.button("Run Appraisal", disabled=run_disabled):
-    # MVP step: Upload to S3 + generate presigned URL
-    # Next steps later: SerpApi Lens → OpenAI → pricing_engine (untouched)
     try:
+        # 1) Upload to S3 + presign
         s3_info = upload_bytes_to_s3_and_presign(
             file_bytes=st.session_state.uploaded_image_bytes,
             content_type=st.session_state.uploaded_image_meta.get("content_type", ""),
             original_filename=st.session_state.uploaded_image_meta.get("filename", "upload"),
         )
 
+        # 2) SerpApi Google Lens (uses the presigned URL)
+        lens = serpapi_google_lens_search(s3_info["presigned_url"])
+
+        # 3) Store results
         st.session_state.results = {
-            "status": "uploaded_to_s3",
-            "message": "Image uploaded and presigned URL generated (pipeline still stubbed).",
+            "status": "lens_ok",
+            "message": "Image uploaded, presigned URL generated, and Google Lens results fetched.",
             "timestamp": datetime.utcnow().isoformat(),
             "traceability": {
                 "image": {
@@ -150,15 +176,22 @@ if st.button("Run Appraisal", disabled=run_disabled):
                     "presigned_url": s3_info["presigned_url"],
                     "ttl_seconds": s3_info["ttl_seconds"],
                 },
-                "next": "Pass traceability.s3.presigned_url to SerpApi Google Lens",
+                "search": {
+                    "provider": "serpapi",
+                    "engine": "google_lens",
+                    "raw": lens
+                },
+                "next": "Extract top matches → OpenAI → pricing_engine",
             },
         }
+
     except Exception as e:
         st.session_state.results = {
             "status": "error",
-            "message": f"S3 upload failed: {type(e).__name__}: {e}",
+            "message": f"Appraisal failed: {type(e).__name__}: {e}",
             "timestamp": datetime.utcnow().isoformat(),
         }
+
 
 
 # -----------------------------
