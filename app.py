@@ -279,6 +279,124 @@ if st.button("Run Appraisal", disabled=run_disabled, key="run_appraisal_btn"):
             "timestamp": datetime.utcnow().isoformat(),
         }
 
+from urllib.parse import urlparse
+
+def _domain(url: str) -> str:
+    try:
+        return urlparse(url).netloc.replace("www.", "")
+    except Exception:
+        return ""
+
+def _pill(label: str, value: str):
+    st.markdown(
+        f"""
+        <div style="display:inline-block;padding:6px 10px;border:1px solid #2b2b2b;border-radius:10px;margin-right:8px;">
+          <div style="font-size:12px;opacity:0.7">{label}</div>
+          <div style="font-size:16px;font-weight:700">{value}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def render_results_ui(results: dict):
+    trace = results.get("traceability", {})
+    img = trace.get("image", {})
+    s3 = trace.get("s3", {})
+    presigned_url = s3.get("presigned_url", "")
+
+    matches = trace.get("search_summary", {}).get("top_matches", [])
+    # Heuristic split (keep it simple for MVP)
+    auction = [m for m in matches if "auction" in (m.get("source","").lower() + " " + _domain(m.get("link","")).lower())]
+    retail = [m for m in matches if m not in auction]
+
+    # Header row
+    left, right = st.columns([3, 1])
+    with left:
+        st.subheader("Top Matches")
+        st.caption(f"{img.get('filename','')} • Auction: {len(auction)} • Retail: {len(retail)} • Total: {len(matches)}")
+    with right:
+        # Export button (only if you already wired export_to_google_sheets)
+        if "export_to_google_sheets" in globals():
+            if st.button("Export to Google Sheet", key="export_btn_top"):
+                try:
+                    export_to_google_sheets(results)
+                    st.success("Exported to Google Sheet (Auction + Retail).")
+                except Exception as e:
+                    st.error(f"Export failed: {type(e).__name__}: {e}")
+        else:
+            st.button("Export to Google Sheet", disabled=True, key="export_btn_top_disabled")
+
+    st.divider()
+
+    # Layout: thumbnail + results
+    rail, main = st.columns([1, 3], vertical_alignment="top")
+
+    with rail:
+        if presigned_url:
+            st.image(presigned_url, use_container_width=True)
+        st.caption("Newel SKU / File")
+        st.markdown(f"**{img.get('filename','—')}**")
+
+        show_thumbs = st.toggle("Show result thumbnails", value=False, key="show_result_thumbs")
+
+    with main:
+        tab_a, tab_r = st.tabs([f"Auction ({len(auction)})", f"Retail ({len(retail)})"])
+
+        def render_card(i: int, m: dict, kind: str):
+            title = (m.get("title") or "").strip() or "(untitled)"
+            link = m.get("link") or ""
+            src = (m.get("source") or "").strip()
+            dom = _domain(link)
+
+            with st.container(border=True):
+                cols = st.columns([1, 6]) if show_thumbs else [None, None]
+                if show_thumbs:
+                    with cols[0]:
+                        thumb = m.get("thumbnail") or presigned_url
+                        if thumb:
+                            st.image(thumb, use_container_width=True)
+                    body = cols[1]
+                else:
+                    body = st
+
+                with body:
+                    st.markdown(f"**{i}. {title}**")
+                    if link:
+                        st.markdown(link)
+                    if src or dom:
+                        st.caption(src or dom)
+
+                    # Financial pills (MVP placeholders using available fields)
+                    # SerpApi may give price sometimes; auction low/high/reserve comes later via extraction.
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        if kind == "auction":
+                            _pill("Auction Low", m.get("auction_low", "—"))
+                        else:
+                            _pill("Retail Price", (str(m.get("price")) if m.get("price") else "—"))
+                    with c2:
+                        if kind == "auction":
+                            _pill("Auction High", m.get("auction_high", "—"))
+                        else:
+                            _pill("Source", src or dom or "—")
+                    with c3:
+                        if kind == "auction":
+                            _pill("Reserve", m.get("auction_reserve", "—"))
+                        else:
+                            _pill("Link", "Open ↗" if link else "—")
+
+        with tab_a:
+            if not auction:
+                st.info("No auction-style matches detected yet.")
+            for idx, m in enumerate(auction, start=1):
+                render_card(idx, m, "auction")
+
+        with tab_r:
+            if not retail:
+                st.info("No retail-style matches detected yet.")
+            for idx, m in enumerate(retail, start=1):
+                render_card(idx, m, "retail")
+
 # =========================
 # 3) Results
 # =========================
