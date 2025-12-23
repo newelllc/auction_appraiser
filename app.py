@@ -1,7 +1,6 @@
 import os
 import uuid
 from datetime import datetime
-
 import boto3
 import requests
 import streamlit as st
@@ -110,28 +109,64 @@ def extract_top_lens_matches(lens_json: dict, limit: int = 5) -> list[dict]:
         })
     return matches
 
+def csv_safe(text: str) -> str:
+    return (text or "").replace('"', '""').replace("\n", " ").replace("\r", " ").strip()
+
+def summarize_matches_for_csv(top_matches: list[dict]) -> dict:
+    titles, sources, links, prices = [], [], [], []
+    for m in top_matches or []:
+        titles.append(csv_safe(m.get("title", "")))
+        sources.append(csv_safe(m.get("source", "")))
+        links.append(csv_safe(m.get("link", "")))
+        price = m.get("price", "")
+        currency = m.get("currency", "")
+        prices.append(csv_safe(f"{currency} {price}".strip()))
+    return {
+        "top_match_titles": " | ".join(titles),
+        "top_match_sources": " | ".join(sources),
+        "top_match_links": " | ".join(links),
+        "top_match_prices": " | ".join(prices),
+        "top_match_count": str(len(top_matches or [])),
+    }
+
 # -----------------------------
 # Google Sheets helpers
 # -----------------------------
-GOOGLE_SHEET_ID = _get_secret("GOOGLE_SHEET_ID")
+GOOGLE_SHEET_ID = "1E5Sq2M1vcC-A70aCUSfY8FFXUdooUw6LGRptmqUrwSM"
 
 def sheets_client():
-    sa_info = dict(st.secrets["google_service_account"])
+    # Pull from TOML table and normalize types to plain strings
+    sa_raw = st.secrets["google_service_account"]
+    sa_info = {k: ("" if sa_raw[k] is None else str(sa_raw[k])) for k in sa_raw.keys()}
+
+    # Normalize private key newlines (handles either PEM multiline or \n-escaped)
+    pk = sa_info.get("private_key", "")
+    if "\\n" in pk:
+        pk = pk.replace("\\n", "\n")
+    sa_info["private_key"] = pk
+
     creds = service_account.Credentials.from_service_account_info(
         sa_info,
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
-    return build("sheets", "v4", credentials=creds)
+
+    # cache_discovery=False avoids file/seek issues in hosted environments (Streamlit Cloud)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 def append_row(tab_name: str, row_values: list):
     svc = sheets_client()
+
+    # Ensure no None values get sent to Sheets
+    safe_values = ["" if v is None else str(v) for v in row_values]
+
     svc.spreadsheets().values().append(
         spreadsheetId=GOOGLE_SHEET_ID,
         range=f"{tab_name}!A:Z",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
-        body={"values": [row_values]},
+        body={"values": [safe_values]},
     ).execute()
+
 
 def export_to_google_sheets(results: dict):
     trace = results.get("traceability", {})
@@ -141,6 +176,7 @@ def export_to_google_sheets(results: dict):
 
     matches = trace.get("search_summary", {}).get("top_matches", [])
 
+    # MVP heuristic split
     auction = [m for m in matches if "auction" in (m.get("source","").lower())]
     retail = [m for m in matches if m not in auction]
 
@@ -199,6 +235,7 @@ if st.button("Run Appraisal", disabled=not st.session_state.image_uploaded):
         )
         lens = serpapi_google_lens_search(s3_info["presigned_url"])
         top_matches = extract_top_lens_matches(lens, 5)
+        csv_summary = summarize_matches_for_csv(top_matches)
 
         st.session_state.results = {
             "status": "lens_ok",
@@ -209,6 +246,7 @@ if st.button("Run Appraisal", disabled=not st.session_state.image_uploaded):
                 "s3": s3_info,
                 "search_summary": {"top_matches": top_matches},
             },
+            "csv_summary": csv_summary,
         }
     except Exception as e:
         st.session_state.results = {
