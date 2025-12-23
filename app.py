@@ -409,6 +409,15 @@ if st.session_state.results:
     with st.expander("Show raw SerpApi response (for provenance)"):
         st.json(st.session_state.results.get("traceability", {}).get("search", {}).get("raw", {}))
 
+    render_results_ui(st.session_state.results)
+
+with st.expander("JSON Output (collapsed)"):
+    st.json(st.session_state.results, expanded=False)
+
+with st.expander("Raw SerpApi response (provenance)"):
+    st.json(st.session_state.results.get("traceability", {}).get("search", {}).get("raw", {}))
+
+
     # Export button (Google Sheets)
     st.subheader("Export")
     if st.button("Export to Google Sheet", key="export_google_sheet_btn"):
