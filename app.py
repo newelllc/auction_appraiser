@@ -208,6 +208,9 @@ def export_to_google_sheets(results: dict):
 # UI Rendering Helper
 # =========================
 def render_results_ui(results: dict):
+    if not results:
+        return
+        
     if results.get("status") == "error":
         st.error(results.get("message"))
         return
@@ -246,7 +249,96 @@ def render_results_ui(results: dict):
 # =========================
 # Session State Init
 # =========================
+# Using dictionary-style access and 'in' checks to prevent AttributeErrors
 if "image_uploaded" not in st.session_state:
-    st.session_state.image_uploaded = False
+    st.session_state["image_uploaded"] = False
 if "uploaded_image_bytes" not in st.session_state:
-    st.session_state.uploaded_
+    st.session_state["uploaded_image_bytes"] = None
+if "uploaded_image_meta" not in st.session_state:
+    st.session_state["uploaded_image_meta"] = None
+if "results" not in st.session_state:
+    st.session_state["results"] = None
+
+# =========================
+# 1) Upload
+# =========================
+st.header("1. Upload Item Image")
+
+uploaded_file = st.file_uploader(
+    "Upload a clear photo of the item",
+    type=["jpg", "jpeg", "png"],
+    key="item_image_uploader",
+)
+
+if uploaded_file is not None:
+    st.session_state["image_uploaded"] = True
+    st.session_state["uploaded_image_bytes"] = uploaded_file.getvalue()
+    st.session_state["uploaded_image_meta"] = {
+        "filename": uploaded_file.name,
+        "content_type": uploaded_file.type,
+        "size_bytes": len(st.session_state["uploaded_image_bytes"]),
+    }
+    st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
+
+# =========================
+# 2) Run Appraisal
+# =========================
+st.header("2. Run Appraisal")
+
+# Safe access to session state to prevent AttributeErrors
+is_uploaded = st.session_state.get("image_uploaded", False)
+run_disabled = not is_uploaded
+
+if st.button("Run Appraisal", disabled=run_disabled, key="run_appraisal_btn"):
+    with st.spinner("Processing image and searching..."):
+        try:
+            # Safely retrieve values from session state
+            img_bytes = st.session_state.get("uploaded_image_bytes")
+            img_meta = st.session_state.get("uploaded_image_meta", {})
+            
+            s3_info = upload_bytes_to_s3_and_presign(
+                file_bytes=img_bytes,
+                content_type=img_meta.get("content_type", ""),
+                original_filename=img_meta.get("filename", "upload"),
+            )
+
+            lens = serpapi_google_lens_search(s3_info["presigned_url"])
+            top_matches = extract_top_lens_matches(lens, limit=5)
+            csv_summary = summarize_matches_for_csv(top_matches)
+
+            st.session_state["results"] = {
+                "status": "lens_ok",
+                "message": "Image processed successfully.",
+                "timestamp": datetime.utcnow().isoformat(),
+                "traceability": {
+                    "image": img_meta,
+                    "s3": s3_info,
+                    "search": {"provider": "serpapi", "engine": "google_lens", "raw": lens},
+                    "search_summary": {"top_matches": top_matches},
+                },
+                "csv_summary": csv_summary,
+            }
+        except Exception as e:
+            st.session_state["results"] = {
+                "status": "error",
+                "message": f"Appraisal failed: {type(e).__name__}: {e}",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
+# =========================
+# 3) Results
+# =========================
+st.header("3. Results")
+
+current_results = st.session_state.get("results")
+
+if current_results:
+    # Now defined and safe to call
+    render_results_ui(current_results)
+
+    with st.expander("JSON Output"):
+        st.json(current_results, expanded=False)
+
+    with st.expander("CSV Output (Single Row)"):
+        r = current_results
+        presigned_url = r.get("traceability", {}
