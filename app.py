@@ -302,7 +302,8 @@ if st.session_state.results:
         cs = r.get("csv_summary", {})
         csv_data = (
             "status,message,timestamp,presigned_url,"
-            "top_match_count,top_match_titles,top_match_sources,top_match_links,top_match_prices\n"
+            "top_match_count,top_match_titles,top_match_sources,top_match_links,top_match_prices
+"
             f"\"{csv_safe(r.get('status',''))}\","
             f"\"{csv_safe(r.get('message',''))}\","
             f"\"{csv_safe(r.get('timestamp',''))}\","
@@ -311,7 +312,8 @@ if st.session_state.results:
             f"\"{csv_safe(cs.get('top_match_titles',''))}\","
             f"\"{csv_safe(cs.get('top_match_sources',''))}\","
             f"\"{csv_safe(cs.get('top_match_links',''))}\","
-            f"\"{csv_safe(cs.get('top_match_prices',''))}\"\n"
+            f"\"{csv_safe(cs.get('top_match_prices',''))}\"
+"
         )
 
         st.download_button(
@@ -323,7 +325,6 @@ if st.session_state.results:
         )
 else:
     st.info("No appraisal run yet.")
-
 
 st.divider()
 st.caption("Traceability: image → S3 presigned URL → Google Lens → export (pricing stubbed)")
