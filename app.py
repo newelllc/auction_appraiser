@@ -180,6 +180,7 @@ st.header("1. Upload Item Image")
 uploaded_file = st.file_uploader(
     "Upload a clear photo of the item",
     type=["jpg", "jpeg", "png"]
+    key="item_image_uploader"
 )
 
 if uploaded_file:
