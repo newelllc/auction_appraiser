@@ -86,4 +86,4 @@ if uploaded_file is not None:
         "content_type": uploaded_file.type,
         "size_bytes": len(st.session_state.uploaded_image_bytes),
     }
-    st.image(uploaded_file, caption="U_
+    st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
