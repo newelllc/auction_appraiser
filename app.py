@@ -247,34 +247,34 @@ if st.button("Run Appraisal", disabled=run_disabled):
 
         # 3) Store results
         st.session_state.results = {
-            "status": "lens_ok",
-            "message": "Image uploaded, presigned URL generated, and Google Lens results fetched.",
-            "timestamp": datetime.utcnow().isoformat(),
-            "traceability": {
-                "image": {
-                    "filename": st.session_state.uploaded_image_meta.get("filename"),
-                    "content_type": st.session_state.uploaded_image_meta.get("content_type"),
-                    "size_bytes": st.session_state.uploaded_image_meta.get("size_bytes"),
-                    
-},
-
-                },
-                "s3": {
-                    "bucket": s3_info["bucket"],
-                    "key": s3_info["key"],
-                    "presigned_url": s3_info["presigned_url"],
-                    "ttl_seconds": s3_info["ttl_seconds"],
-                },
-                "search": {
-                    "provider": "serpapi",
-                    "engine": "google_lens",
-                    "raw": lens
-                },
-                "next": "Extract top matches → OpenAI → pricing_engine",
-            },
+    "status": "lens_ok",
+    "message": "Image uploaded, presigned URL generated, and Google Lens results fetched.",
+    "timestamp": datetime.utcnow().isoformat(),
+    "traceability": {
+        "image": {
+            "filename": st.session_state.uploaded_image_meta.get("filename"),
+            "content_type": st.session_state.uploaded_image_meta.get("content_type"),
+            "size_bytes": st.session_state.uploaded_image_meta.get("size_bytes"),
+        },
+        "s3": {
+            "bucket": s3_info["bucket"],
+            "key": s3_info["key"],
+            "presigned_url": s3_info["presigned_url"],
+            "ttl_seconds": s3_info["ttl_seconds"],
+        },
+        "search": {
+            "provider": "serpapi",
+            "engine": "google_lens",
+            "raw": lens,
+        },
         "search_summary": {
-                        "top_matches": top_matches
-        }
+            "top_matches": top_matches
+        },
+        "next": "Extract top matches → OpenAI → pricing_engine",
+    },
+    "csv_summary": csv_summary,
+}
+
 
     except Exception as e:
         st.session_state.results = {
