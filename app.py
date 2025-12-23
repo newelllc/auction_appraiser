@@ -1,7 +1,6 @@
 import os
 import uuid
 from datetime import datetime
-import json as _json
 
 import boto3
 import requests
@@ -111,33 +110,13 @@ def extract_top_lens_matches(lens_json: dict, limit: int = 5) -> list[dict]:
         })
     return matches
 
-def csv_safe(text: str) -> str:
-    return (text or "").replace('"', '""').replace("\n", " ").replace("\r", " ").strip()
-
-def summarize_matches_for_csv(top_matches: list[dict]) -> dict:
-    titles, sources, links, prices = [], [], [], []
-    for m in top_matches or []:
-        titles.append(csv_safe(m.get("title", "")))
-        sources.append(csv_safe(m.get("source", "")))
-        links.append(csv_safe(m.get("link", "")))
-        price = m.get("price", "")
-        currency = m.get("currency", "")
-        prices.append(csv_safe(f"{currency} {price}".strip()))
-    return {
-        "top_match_titles": " | ".join(titles),
-        "top_match_sources": " | ".join(sources),
-        "top_match_links": " | ".join(links),
-        "top_match_prices": " | ".join(prices),
-        "top_match_count": str(len(top_matches or [])),
-    }
-
 # -----------------------------
 # Google Sheets helpers
 # -----------------------------
-GOOGLE_SHEET_ID = "1E5Sq2M1vcC-A70aCUSfY8FFXUdooUw6LGRptmqUrwSM"
+GOOGLE_SHEET_ID = _get_secret("GOOGLE_SHEET_ID")
 
 def sheets_client():
-    sa_info = _json.loads(_get_secret("GOOGLE_SERVICE_ACCOUNT_JSON"))
+    sa_info = dict(st.secrets["google_service_account"])
     creds = service_account.Credentials.from_service_account_info(
         sa_info,
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
@@ -162,7 +141,6 @@ def export_to_google_sheets(results: dict):
 
     matches = trace.get("search_summary", {}).get("top_matches", [])
 
-    # MVP heuristic split
     auction = [m for m in matches if "auction" in (m.get("source","").lower())]
     retail = [m for m in matches if m not in auction]
 
@@ -221,7 +199,6 @@ if st.button("Run Appraisal", disabled=not st.session_state.image_uploaded):
         )
         lens = serpapi_google_lens_search(s3_info["presigned_url"])
         top_matches = extract_top_lens_matches(lens, 5)
-        csv_summary = summarize_matches_for_csv(top_matches)
 
         st.session_state.results = {
             "status": "lens_ok",
@@ -232,7 +209,6 @@ if st.button("Run Appraisal", disabled=not st.session_state.image_uploaded):
                 "s3": s3_info,
                 "search_summary": {"top_matches": top_matches},
             },
-            "csv_summary": csv_summary,
         }
     except Exception as e:
         st.session_state.results = {
