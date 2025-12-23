@@ -147,6 +147,90 @@ st.header("2. Run Appraisal")
 
 run_disabled = not st.session_state.image_uploaded
 
+import streamlit as st
+import json
+from datetime import datetime
+
+# -----------------------------
+# Page Config
+# -----------------------------
+st.set_page_config(
+    page_title="Newel Appraiser MVP",
+    layout="centered"
+)
+
+st.title("Newel Appraiser")
+st.caption("Internal MVP • Image-based appraisal")
+
+# -----------------------------
+# Session State Init
+# -----------------------------
+if "image_uploaded" not in st.session_state:
+    st.session_state.image_uploaded = False
+
+if "results" not in st.session_state:
+    st.session_state.results = None
+
+# -----------------------------
+# Image Upload Section
+# -----------------------------
+st.header("1. Upload Item Image")
+
+uploaded_file = st.file_uploader(
+    "Upload a clear photo of the item",
+    type=["jpg", "jpeg", "png"]
+)
+
+if uploaded_file:
+    st.session_state.image_uploaded = True
+    st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
+
+# -----------------------------
+# Action Button
+# -----------------------------
+st.header("2. Run Appraisal")
+
+run_disabled = not st.session_state.image_uploaded
+
+if st.button("Run Appraisal", disabled=run_disabled):
+    # Placeholder for pipeline
+    # S3 upload → SerpApi Lens → OpenAI → pricing_engine
+    st.session_state.results = {
+        "status": "stub",
+        "message": "Pipeline not yet connected",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+# -----------------------------
+# Results Section
+# -----------------------------
+st.header("3. Results")
+
+if st.session_state.results:
+    st.subheader("JSON Output")
+    st.json(st.session_state.results)
+
+    # Single-row CSV placeholder
+    st.subheader("CSV Output (Single Row)")
+    st.download_button(
+        label="Download CSV",
+        data="status,message,timestamp\n"
+             f"{st.session_state.results['status']},"
+             f"{st.session_state.results['message']},"
+             f"{st.session_state.results['timestamp']}\n",
+        file_name="appraisal_result.csv",
+        mime="text/csv"
+    )
+else:
+    st.info("No appraisal run yet.")
+
+# -----------------------------
+# Footer / Traceability
+# -----------------------------
+st.divider()
+st.caption("Traceability: image → search → model → pricing (stubbed)")
+
+
 if st.button("Run Appraisal", disabled=run_disabled):
     try:
         # 1) Upload to S3 + presign
@@ -158,6 +242,8 @@ if st.button("Run Appraisal", disabled=run_disabled):
 
         # 2) SerpApi Google Lens (uses the presigned URL)
         lens = serpapi_google_lens_search(s3_info["presigned_url"])
+        top_matches = extract_top_lens_matches(lens, limit=5)
+
 
         # 3) Store results
         st.session_state.results = {
@@ -169,6 +255,9 @@ if st.button("Run Appraisal", disabled=run_disabled):
                     "filename": st.session_state.uploaded_image_meta.get("filename"),
                     "content_type": st.session_state.uploaded_image_meta.get("content_type"),
                     "size_bytes": st.session_state.uploaded_image_meta.get("size_bytes"),
+                    
+},
+
                 },
                 "s3": {
                     "bucket": s3_info["bucket"],
@@ -183,6 +272,8 @@ if st.button("Run Appraisal", disabled=run_disabled):
                 },
                 "next": "Extract top matches → OpenAI → pricing_engine",
             },
+        "search_summary": {
+                        "top_matches": top_matches
         }
 
     except Exception as e:
@@ -201,9 +292,19 @@ st.header("3. Results")
 
 if st.session_state.results:
     st.subheader("JSON Output")
-    st.json(st.session_state.results)
+    st.json(st.session_state.results, expanded=False)
+
+    # Raw SerpApi response (provenance only)
+    with st.expander("Show raw SerpApi response (for provenance)"):
+        st.json(
+            st.session_state.results
+            .get("traceability", {})
+            .get("search", {})
+            .get("raw", {})
+        )
 
     st.subheader("CSV Output (Single Row)")
+
     r = st.session_state.results
 
     presigned_url = (
@@ -212,13 +313,26 @@ if st.session_state.results:
          .get("presigned_url", "")
     )
 
-    # MVP requirement: single-row CSV output
+    csv_summary = r.get("csv_summary", {})
+    top_match_count = csv_summary.get("top_match_count", "")
+    top_match_titles = csv_summary.get("top_match_titles", "")
+    top_match_sources = csv_summary.get("top_match_sources", "")
+    top_match_links = csv_summary.get("top_match_links", "")
+    top_match_prices = csv_summary.get("top_match_prices", "")
+
     csv_data = (
-        "status,message,timestamp,presigned_url\n"
-        f"{r.get('status','')},"
-        f"{r.get('message','')},"
-        f"{r.get('timestamp','')},"
-        f"\"{presigned_url}\"\n"
+        "status,message,timestamp,presigned_url,"
+        "top_match_count,top_match_titles,top_match_sources,"
+        "top_match_links,top_match_prices\n"
+        f"\"{csv_safe(r.get('status',''))}\","
+        f"\"{csv_safe(r.get('message',''))}\","
+        f"\"{csv_safe(r.get('timestamp',''))}\","
+        f"\"{csv_safe(presigned_url)}\","
+        f"\"{csv_safe(top_match_count)}\","
+        f"\"{csv_safe(top_match_titles)}\","
+        f"\"{csv_safe(top_match_sources)}\","
+        f"\"{csv_safe(top_match_links)}\","
+        f"\"{csv_safe(top_match_prices)}\"\n"
     )
 
     st.download_button(
@@ -229,6 +343,7 @@ if st.session_state.results:
     )
 else:
     st.info("No appraisal run yet.")
+
 
 
 # -----------------------------
