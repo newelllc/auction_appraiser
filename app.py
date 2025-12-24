@@ -15,11 +15,10 @@ from google.auth.transport.requests import Request
 st.set_page_config(page_title="Newel Appraiser MVP", layout="wide")
 
 def apply_newel_branding():
-    # Force EB Garamond and high-contrast palette
     st.markdown("""
-        <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:wght@400;700&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,700;1,400;1,700&display=swap" rel="stylesheet">
         <style>
-        /* 1. Global Reset - Force Light Mode and Dark Text */
+        /* Global Reset */
         .stApp {
             background-color: #FBF5EB !important;
             font-family: 'EB Garamond', serif !important;
@@ -29,71 +28,75 @@ def apply_newel_branding():
             font-family: 'EB Garamond', serif !important;
         }
 
-        /* 2. Sidebar - Mustard/Cream variant */
+        /* Sidebar Branding */
         [data-testid="stSidebar"] {
             background-color: #F8F2E8 !important;
             border-right: 1px solid #C2C2C2;
         }
-        .sidebar-title {
+        .sidebar-logo {
             color: #8B0000 !important;
-            font-size: 2.2rem;
+            font-size: 2.8rem;
             font-weight: 700;
             text-align: center;
-            letter-spacing: 0.1em;
+            letter-spacing: 0.15em;
             margin-bottom: 0px;
+            text-transform: uppercase;
         }
 
-        /* 3. Headers - Newel Red */
+        /* Headers - Newel Red */
         h1, h2, h3, .brand-header {
             color: #8B0000 !important;
             text-transform: uppercase;
-            letter-spacing: 0.1em;
+            letter-spacing: 0.12em;
             font-weight: 700 !important;
         }
 
-        /* 4. Buttons - Black with Cream Text (Primary CTA style) */
+        /* Primary Action Buttons (Rectangular Black) */
         div.stButton > button {
             background-color: #1C1C1E !important;
             color: #FBF5EB !important;
             border-radius: 0px !important;
             border: none !important;
-            padding: 0.8rem 2rem !important;
+            padding: 0.9rem 2.2rem !important;
             font-weight: 700;
             text-transform: uppercase;
             width: 100%;
+            letter-spacing: 0.1em;
         }
         div.stButton > button:hover {
             background-color: #8B0000 !important;
             color: #FBF5EB !important;
         }
 
-        /* 5. File Uploader - Remove Dark Overlays */
+        /* File Uploader Clean-up */
         [data-testid="stFileUploader"] { background-color: transparent !important; }
         [data-testid="stFileUploader"] section {
             background-color: #FBF5EB !important;
             border: 1px dashed #C2C2C2 !important;
         }
 
-        /* 6. Result Cards - White with Grey Border */
+        /* Results Display */
         .result-card {
             background-color: white !important;
-            padding: 20px;
+            padding: 24px;
             border: 1px solid #C2C2C2;
-            margin-bottom: 15px;
+            margin-bottom: 18px;
             border-radius: 0px;
         }
         .pill {
             background-color: #EFDAAC !important;
-            padding: 5px 12px;
-            border-radius: 20px;
+            padding: 6px 14px;
+            border-radius: 24px;
             font-weight: 700;
             color: #1C1C1E !important;
             display: inline-block;
-            margin: 5px 5px 0 0;
+            margin: 6px 6px 0 0;
+            font-size: 0.9rem;
         }
         a {
             color: #8B0000 !important;
             text-decoration: underline;
+            font-weight: 700;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -106,7 +109,7 @@ apply_newel_branding()
 def _get_secret(name: str) -> str:
     if name in st.secrets: return str(st.secrets[name])
     val = os.getenv(name)
-    if not val: raise RuntimeError(f"Missing secret: {name}")
+    if not val: raise RuntimeError(f"Missing required secret: {name}")
     return val
 
 # ==========================================
@@ -116,7 +119,7 @@ def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
     genai.configure(api_key=_get_secret("GEMINI_API_KEY"))
     model = genai.GenerativeModel("gemini-2.0-flash")
     context = [{"title": m.get("title"), "source": m.get("source")} for m in matches]
-    prompt = f"Expert: Classify matches into 'auction' or 'retail'. Data: {json.dumps(context)}. Return JSON object with key 'results'."
+    prompt = f"Appraiser Expert: Classify matches into 'auction' or 'retail'. Extract: auction_low, auction_high, retail_price. Data: {json.dumps(context)}. Return JSON with key 'results'."
     try:
         response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         ai_data = json.loads(response.text).get("results", [])
@@ -124,7 +127,7 @@ def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
             if i < len(ai_data): m.update(ai_data[i])
         return matches
     except Exception as e:
-        st.error(f"AI Error: {e}")
+        st.error(f"AI Classification Error: {e}")
         return matches
 
 # ==========================================
@@ -164,11 +167,11 @@ def export_to_google_sheets(results: dict):
 # 5. UI COMPONENTS
 # ==========================================
 with st.sidebar:
-    st.markdown("<div class='sidebar-title'>NEWEL</div>", unsafe_allow_html=True)
+    st.markdown("<div class='sidebar-logo'>NEWEL</div>", unsafe_allow_html=True)
     st.divider()
     sku = st.session_state.get("uploaded_image_meta", {}).get("filename", "N/A")
     st.markdown(f"**SKU Label:** `{sku}`")
-    if st.button("🔄 START NEW APPRAISAL"):
+    if st.button("START NEW APPRAISAL"):
         for key in st.session_state.keys(): del st.session_state[key]
         st.rerun()
 
@@ -176,7 +179,7 @@ st.markdown("<h1 class='brand-header'>Newel Appraiser</h1>", unsafe_allow_html=T
 
 # 1. Upload
 st.header("1. Upload Item Image")
-uploaded_file = st.file_uploader("Upload item photo", type=["jpg", "jpeg", "png"])
+uploaded_file = st.file_uploader("Upload item photo for appraisal", type=["jpg", "jpeg", "png"])
 
 if uploaded_file:
     st.session_state["uploaded_image_bytes"] = uploaded_file.getvalue()
@@ -186,7 +189,7 @@ if uploaded_file:
 # 2. Run
 st.header("2. Run Appraisal")
 if st.button("RUN APPRAISAL", disabled=not uploaded_file):
-    with st.spinner("Processing..."):
+    with st.spinner("Analyzing visually and classifying sources..."):
         s3 = boto3.client("s3", region_name=_get_secret("AWS_REGION"), 
                           aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"), 
                           aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"))
@@ -211,20 +214,20 @@ if res:
 
     def render_cards(subset, is_priced):
         if not subset:
-            st.info("No matches found.")
+            st.info("No relevant matches found in this category.")
             return
         for m in subset:
             auc_pill = f"<div class='pill'>Low: {m.get('auction_low')} | High: {m.get('auction_high')}</div>" if is_priced and m.get("auction_low") else ""
-            ret_pill = f"<div class='pill'>Retail: {m.get('retail_price')}</div>" if is_priced and m.get("retail_price") else ""
+            ret_pill = f"<div class='pill'>Price: {m.get('retail_price')}</div>" if is_priced and m.get("retail_price") else ""
             st.markdown(f"""
                 <div class="result-card">
-                  <div style="display:flex; gap:16px;">
-                    <img src="{m.get('thumbnail')}" width="110" style="object-fit:contain; border:1px solid #CFC7BC; background:#FFF;" />
+                  <div style="display:flex; gap:20px;">
+                    <img src="{m.get('thumbnail')}" width="120" style="object-fit:contain; border:1px solid #CFC7BC; background:#FFF;" />
                     <div>
-                      <div style="font-weight:700; font-size:1.1rem;">{m.get('title')}</div>
-                      <div>Source: {m.get('source')}</div>
+                      <div style="font-weight:700; font-size:1.2rem; margin-bottom:4px;">{m.get('title')}</div>
+                      <div style="font-style:italic; margin-bottom:8px;">Source: {m.get('source')}</div>
                       {auc_pill} {ret_pill}
-                      <div style="margin-top:10px;"><a href="{m.get('link')}" target="_blank">VIEW LISTING</a></div>
+                      <div style="margin-top:14px;"><a href="{m.get('link')}" target="_blank">VIEW LISTING</a></div>
                     </div>
                   </div>
                 </div>
@@ -234,12 +237,12 @@ if res:
     with t_ret: render_cards([m for m in matches if m.get("kind") == "retail"], True)
     with t_misc: render_cards([m for m in matches if m.get("kind") not in ("auction", "retail")], False)
 
-    if st.button("🚀 EXPORT TO GOOGLE SHEETS"):
-        with st.spinner("Exporting..."):
+    if st.button("🚀 EXPORT TO MASTER GOOGLE SHEET"):
+        with st.spinner("Processing spreadsheet append..."):
             try:
                 export_to_google_sheets(res)
-                st.toast("Success!")
-                st.markdown(f"[View Master Sheet]({_get_secret('GOOGLE_SHEET_URL')})")
-            except Exception as e: st.error(f"Export failed: {e}")
+                st.toast("Success: Row Appended")
+                st.markdown(f"[VIEW MASTER TRACKING SHEET]({_get_secret('GOOGLE_SHEET_URL')})")
+            except Exception as e: st.error(f"Spreadsheet Export Failed: {e}")
 else:
-    st.info("No appraisal run yet.")
+    st.info("No appraisal run yet. Upload a photo above to begin.")
