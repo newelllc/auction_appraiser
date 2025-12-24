@@ -1,6 +1,8 @@
 import os
 import uuid
 import json
+import time
+import hashlib
 import boto3
 import requests
 import streamlit as st
@@ -16,10 +18,10 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Newel Appraiser MVP", layout="wide")
 
 # ==========================================
-# 2. BRAND / UI STYLES (SAFE INJECTION)
-#    - Avoids CSS rendering as text
-#    - Forces readable light UI
-#    - Makes all buttons red w/ white text
+# 2. BRAND / UI STYLES
+#    - Light background + readable text
+#    - ALL buttons red w/ white text (includes Browse files)
+#    - Larger NEWEL logo (no EST 1939)
 # ==========================================
 def apply_newel_branding():
     components.html(
@@ -214,32 +216,127 @@ def _get_secret(name: str) -> str:
     return val
 
 # ==========================================
-# 4. SERVICE: GEMINI CLASSIFICATION
+# 4. GEMINI: FALLBACK + CACHING (NO QUOTA = KEEP RUNNING)
 # ==========================================
-def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
-    genai.configure(api_key=_get_secret("GEMINI_API_KEY"))
-    model = genai.GenerativeModel("gemini-2.0-flash")
+def _simple_kind_fallback(match: dict) -> dict:
+    """
+    Heuristic fallback when Gemini is unavailable.
+    Ensures keys exist so downstream UI/export doesn't break.
+    """
+    title = (match.get("title") or "").lower()
+    source = (match.get("source") or "").lower()
+    link = (match.get("link") or "").lower()
+    text = f"{title} {source} {link}"
 
-    context = [{"title": m.get("title"), "source": m.get("source"), "link": m.get("link")} for m in matches]
-    prompt = f"""
+    auction_signals = [
+        "liveauctioneers", "invaluable", "sothebys", "christies", "bonhams",
+        "heritage", "auction", "lot", "bids", "estimate", "hammer"
+    ]
+    retail_signals = [
+        "chairish", "1stdibs", "ebay", "etsy", "amazon", "walmart", "wayfair",
+        "buy now", "add to cart", "shop", "sale", "price"
+    ]
+
+    a = sum(1 for s in auction_signals if s in text)
+    r = sum(1 for s in retail_signals if s in text)
+
+    if a > r and a > 0:
+        match["kind"] = "auction"
+        match["confidence"] = 0.55
+    elif r > a and r > 0:
+        match["kind"] = "retail"
+        match["confidence"] = 0.55
+    else:
+        match["kind"] = "other"
+        match["confidence"] = 0.35
+
+    match.setdefault("auction_low", None)
+    match.setdefault("auction_high", None)
+    match.setdefault("auction_reserve", None)
+    match.setdefault("retail_price", None)
+    return match
+
+def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
+    """
+    Calls Gemini to classify matches.
+    If Gemini quota/rate-limit fails, falls back to heuristic classification.
+    Also caches to avoid repeated calls.
+    """
+    if "gemini_cache" not in st.session_state:
+        st.session_state["gemini_cache"] = {}
+    if "gemini_error_banner_shown" not in st.session_state:
+        st.session_state["gemini_error_banner_shown"] = False
+
+    # Toggle allows staff to run without Gemini
+    use_gemini = st.session_state.get("use_gemini", True)
+    if not use_gemini:
+        return [_simple_kind_fallback(m) for m in matches]
+
+    payload = [{"title": m.get("title"), "source": m.get("source"), "link": m.get("link")} for m in matches]
+    cache_key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+    if cache_key in st.session_state["gemini_cache"]:
+        cached = st.session_state["gemini_cache"][cache_key]
+        for i, m in enumerate(matches):
+            if i < len(cached):
+                m.update(cached[i])
+            # ensure keys exist
+            m.setdefault("kind", "other")
+            m.setdefault("confidence", None)
+            m.setdefault("auction_low", None)
+            m.setdefault("auction_high", None)
+            m.setdefault("auction_reserve", None)
+            m.setdefault("retail_price", None)
+        return matches
+
+    try:
+        genai.configure(api_key=_get_secret("GEMINI_API_KEY"))
+        model = genai.GenerativeModel("gemini-2.0-flash")
+
+        prompt = f"""
 Appraisal Expert: Classify matches into "auction" or "retail".
 Extract: kind (auction/retail), confidence (0.0-1.0), auction_low, auction_high, auction_reserve, retail_price.
-Data: {json.dumps(context)}
+Data: {json.dumps(payload)}
 Return ONLY a JSON object with a key "results" containing the ordered list of objects.
 """
-    try:
-        response = model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json"},
-        )
-        ai_data = json.loads(response.text).get("results", [])
-        for i, match in enumerate(matches):
-            if i < len(ai_data):
-                match.update(ai_data[i])
-        return matches
+
+        # Keep retries short; quota=0 will always fail, but transient 429s may pass.
+        last_err = None
+        for attempt in range(2):
+            try:
+                response = model.generate_content(
+                    prompt,
+                    generation_config={"response_mime_type": "application/json"},
+                )
+                ai_data = json.loads(response.text).get("results", [])
+                for i, m in enumerate(matches):
+                    if i < len(ai_data):
+                        m.update(ai_data[i])
+                    m.setdefault("kind", "other")
+                    m.setdefault("confidence", None)
+                    m.setdefault("auction_low", None)
+                    m.setdefault("auction_high", None)
+                    m.setdefault("auction_reserve", None)
+                    m.setdefault("retail_price", None)
+
+                st.session_state["gemini_cache"][cache_key] = ai_data
+                return matches
+            except Exception as e:
+                last_err = e
+                time.sleep(1.2)
+
+        raise last_err
+
     except Exception as e:
-        st.error(f"Gemini AI Error: {e}")
-        return matches
+        if not st.session_state["gemini_error_banner_shown"]:
+            st.warning(
+                "Gemini classification is unavailable (quota/rate-limit). "
+                "Continuing with fallback classification so the appraisal can run."
+            )
+            st.session_state["gemini_error_banner_shown"] = True
+
+        st.session_state["gemini_last_error"] = str(e)
+        return [_simple_kind_fallback(m) for m in matches]
 
 # ==========================================
 # 5. SERVICE: GOOGLE SHEETS EXPORT (3 COMPS SCHEMA)
@@ -268,7 +365,6 @@ def export_to_google_sheets(results: dict):
                 row.extend([""] * (5 if is_auc else 3))
         return row
 
-    # Service Account in st.secrets["google_service_account"]
     sa_info = st.secrets["google_service_account"]
     creds = service_account.Credentials.from_service_account_info(
         sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -288,8 +384,10 @@ def export_to_google_sheets(results: dict):
 # 6. UI MAIN
 # ==========================================
 with st.sidebar:
-    # Large NEWEL logo (no EST 1939)
     st.markdown("<div class='newel-logo-text'>NEWEL</div>", unsafe_allow_html=True)
+
+    # Optional: allow disabling Gemini when quota is dead
+    st.toggle("Use Gemini classification", value=True, key="use_gemini")
 
     st.divider()
     sku = st.session_state.get("uploaded_image_meta", {}).get("filename", "N/A")
