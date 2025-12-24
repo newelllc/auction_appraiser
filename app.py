@@ -6,70 +6,21 @@ from urllib.parse import urlparse
 import boto3
 import requests
 import streamlit as st
+import base64
 
-import streamlit as st
+# 1. Use a URL if the logo is hosted, OR 
+# 2. Use this robust local check to prevent the app from crashing
+def add_logo():
+    logo_path = "logo.png"
+    try:
+        st.sidebar.image(logo_path, use_container_width=True)
+    except Exception:
+        # Fallback to a text-based brand header if the file is missing
+        st.sidebar.markdown("## NEWEL")
+        st.sidebar.markdown("*EST 1939*")
+        st.sidebar.warning("Note: 'logo.png' not found in root. App continuing with text branding.")
 
-def apply_newel_branding():
-    st.markdown(f"""
-        <style>
-        /* Load Google Fonts */
-        @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;700&family=EB+Garamond:wght@400;500&display=swap');
-
-        /* Main Container Styling */
-        .stApp {{
-            background-color: #F8F2E8; /* Light Brand Neutral [cite: 321] */
-            font-family: 'EB Garamond', serif;
-        }}
-
-        /* Headers [cite: 256, 275] */
-        h1, h2, h3 {{
-            font-family: 'Cormorant Garamond', serif;
-            color: #8B0000; /* Primary Newel Red [cite: 203] */
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }}
-
-        /* Results Card Polish [cite: 3] */
-        div[data-testid="stExpander"] {{
-            background-color: white;
-            border: 1px solid #C2C2C2; /* UI Border Color [cite: 338] */
-            border-radius: 4px;
-        }}
-
-        /* Primary Button [cite: 323, 341] */
-        .stButton>button {{
-            background-color: #1C1C1E; /* Primary Button Default [cite: 332] */
-            color: white;
-            font-family: 'Cormorant Garamond', serif;
-            text-transform: uppercase;
-            border-radius: 0px;
-            border: none;
-            padding: 0.5rem 2rem;
-        }}
-        
-        .stButton>button:hover {{
-            background-color: #8B0000; /* Brand Red Hover [cite: 325] */
-            color: white;
-        }}
-
-        /* Financial "Pills" [cite: 136] */
-        .pill {{
-            background-color: #EFDAAC; /* Accent Background [cite: 322] */
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 0.85rem;
-            font-weight: bold;
-            color: #1C1C1E;
-        }}
-        </style>
-    """, unsafe_allow_html=True)
-
-apply_newel_branding()
-
-# Sidebar: Logo and SKU Placeholder [cite: 4, 130]
-st.sidebar.image("logo.png") # Ensure 'Untitled design.png' is saved as logo.png
-st.sidebar.markdown("### SKU: `FILENAME_PLACEHOLDER` [cite: 4]")
+add_logo()
 
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
