@@ -3,6 +3,10 @@ import uuid
 import json
 import time
 import hashlib
+import re
+from decimal import Decimal, InvalidOperation
+from urllib.parse import urlparse
+
 import boto3
 import requests
 import streamlit as st
@@ -12,16 +16,15 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 import streamlit.components.v1 as components
 
+
 # ==========================================
 # 1. PAGE CONFIG
 # ==========================================
 st.set_page_config(page_title="Newel Appraiser MVP", layout="wide")
 
+
 # ==========================================
 # 2. BRAND / UI STYLES
-#    - Light background + readable text
-#    - ALL buttons red w/ white text (includes Browse files + link_button)
-#    - Larger NEWEL logo (no EST 1939)
 # ==========================================
 def apply_newel_branding():
     components.html(
@@ -37,7 +40,6 @@ def apply_newel_branding():
   --muted:#4A4A4F;
   --border:#CFC7BC;
 
-  /* Button red */
   --btn:#8B0000;
   --btnHover:#A30000;
 
@@ -46,46 +48,21 @@ def apply_newel_branding():
 }
 
 /* Force light mode shell */
-html, body {
-  background: var(--bg) !important;
-  color: var(--text) !important;
-  color-scheme: light !important;
-}
-
-.stApp {
-  background: var(--bg) !important;
-  color: var(--text) !important;
-  font-family: 'EB Garamond', serif !important;
-}
+html, body { background: var(--bg) !important; color: var(--text) !important; color-scheme: light !important; }
+.stApp { background: var(--bg) !important; color: var(--text) !important; font-family: 'EB Garamond', serif !important; }
 
 /* Streamlit chrome */
-[data-testid="stHeader"],
-[data-testid="stToolbar"],
-header {
-  background: var(--bg) !important;
-}
+[data-testid="stHeader"], [data-testid="stToolbar"], header { background: var(--bg) !important; }
 
 /* Main containers */
-[data-testid="stAppViewContainer"],
-[data-testid="stMain"],
-section.main {
-  background: var(--bg) !important;
-}
+[data-testid="stAppViewContainer"], [data-testid="stMain"], section.main { background: var(--bg) !important; }
 
-/* Make all text readable */
-.stApp, .stApp * {
-  color: var(--text) !important;
-  font-family: 'EB Garamond', serif !important;
-}
+/* Global readable text */
+.stApp, .stApp * { color: var(--text) !important; font-family: 'EB Garamond', serif !important; }
 
 /* Sidebar */
-section[data-testid="stSidebar"]{
-  background: var(--bg2) !important;
-  border-right: 1px solid var(--border) !important;
-}
-section[data-testid="stSidebar"] *{
-  color: var(--text) !important;
-}
+section[data-testid="stSidebar"]{ background: var(--bg2) !important; border-right: 1px solid var(--border) !important; }
+section[data-testid="stSidebar"] *{ color: var(--text) !important; }
 
 /* Headings */
 h1, h2, h3 {
@@ -97,11 +74,9 @@ h1, h2, h3 {
 }
 h1 { font-size: 2.4rem !important; margin-bottom: 0.25rem !important; }
 h2 { font-size: 1.6rem !important; margin-top: 1.25rem !important; }
-h3 { font-size: 1.25rem !important; }
 
-/* NEWEL logo text bigger */
+/* NEWEL logo */
 .newel-logo-text {
-  font-family: 'EB Garamond', serif !important;
   font-weight: 700 !important;
   font-size: 3.4rem !important;
   letter-spacing: 0.18em !important;
@@ -110,28 +85,15 @@ h3 { font-size: 1.25rem !important; }
   margin: 0.25rem 0 0.8rem 0 !important;
 }
 
-/* Dividers */
-hr, [data-testid="stDivider"]{
-  border-color: var(--border) !important;
-}
-
-/* File uploader container */
-[data-testid="stFileUploader"] section {
-  background: var(--card) !important;
-  border: 1px dashed var(--border) !important;
-  border-radius: 12px !important;
-}
+/* File uploader */
+[data-testid="stFileUploader"] section,
 [data-testid="stFileUploaderDropzone"]{
   background: var(--card) !important;
   border: 1px dashed var(--border) !important;
   border-radius: 12px !important;
 }
 
-/* ====== ALL BUTTONS: RED with WHITE text ======
-   - Streamlit buttons
-   - "Browse files" uploader button
-   - st.link_button button
-*/
+/* ALL buttons: red w/ white text */
 button, .stButton>button {
   background-color: var(--btn) !important;
   color: #FFFFFF !important;
@@ -142,22 +104,13 @@ button, .stButton>button {
   text-transform: uppercase !important;
   padding: 0.9rem 1.2rem !important;
 }
-button:hover, .stButton>button:hover {
-  background-color: var(--btnHover) !important;
-  color: #FFFFFF !important;
-}
+button:hover, .stButton>button:hover { background-color: var(--btnHover) !important; color: #FFFFFF !important; }
 
 /* Tabs */
-.stTabs [data-baseweb="tab"]{
-  font-weight: 700 !important;
-  letter-spacing: 0.08em !important;
-  text-transform: uppercase !important;
-}
-.stTabs [data-baseweb="tab"][aria-selected="true"]{
-  color: var(--burgundy) !important;
-}
+.stTabs [data-baseweb="tab"]{ font-weight: 700 !important; letter-spacing: 0.08em !important; text-transform: uppercase !important; }
+.stTabs [data-baseweb="tab"][aria-selected="true"]{ color: var(--burgundy) !important; }
 
-/* Result "card" styling for native containers */
+/* Card + pills */
 .result-card {
   background: var(--card) !important;
   border: 1px solid var(--border) !important;
@@ -165,8 +118,6 @@ button:hover, .stButton>button:hover {
   padding: 14px 14px !important;
   margin-bottom: 14px !important;
 }
-
-/* Pills */
 .pill {
   background: var(--gold) !important;
   color: var(--text) !important;
@@ -177,17 +128,10 @@ button:hover, .stButton>button:hover {
   margin-top: 8px !important;
   margin-right: 8px !important;
 }
+.meta { color: var(--muted) !important; font-size: 0.95rem !important; }
 
-/* Small meta text */
-.meta {
-  color: var(--muted) !important;
-  font-size: 0.95rem !important;
-}
-
-/* Alerts/info boxes */
-[data-testid="stAlert"] {
-  border-radius: 12px !important;
-}
+/* Alerts */
+[data-testid="stAlert"] { border-radius: 12px !important; }
 </style>
         """,
         height=0,
@@ -196,8 +140,9 @@ button:hover, .stButton>button:hover {
 
 apply_newel_branding()
 
+
 # ==========================================
-# 3. CORE UTILITIES
+# 3. SECRETS + HELPERS
 # ==========================================
 def _get_secret(name: str) -> str:
     if name in st.secrets:
@@ -207,15 +152,23 @@ def _get_secret(name: str) -> str:
         raise RuntimeError(f"Missing required secret: {name}")
     return val
 
+
 def _fmt_value(v) -> str:
-    """Always show something for required fields."""
     if v is None:
         return "—"
     s = str(v).strip()
     return s if s else "—"
 
+
+def _container_border():
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
+
+
 # ==========================================
-# 4. GEMINI: FALLBACK + CACHING (NO QUOTA = KEEP RUNNING)
+# 4. GEMINI FALLBACK + CACHING
 # ==========================================
 def _simple_kind_fallback(match: dict) -> dict:
     title = (match.get("title") or "").lower()
@@ -250,6 +203,7 @@ def _simple_kind_fallback(match: dict) -> dict:
     match.setdefault("auction_reserve", None)
     match.setdefault("retail_price", None)
     return match
+
 
 def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
     if "gemini_cache" not in st.session_state:
@@ -287,7 +241,6 @@ Extract: kind (auction/retail), confidence (0.0-1.0), auction_low, auction_high,
 Data: {json.dumps(payload)}
 Return ONLY a JSON object with a key "results" containing the ordered list of objects.
 """
-
         last_err = None
         for _attempt in range(2):
             try:
@@ -311,7 +264,6 @@ Return ONLY a JSON object with a key "results" containing the ordered list of ob
             except Exception as e:
                 last_err = e
                 time.sleep(1.2)
-
         raise last_err
 
     except Exception as e:
@@ -321,12 +273,165 @@ Return ONLY a JSON object with a key "results" containing the ordered list of ob
                 "Continuing with fallback classification so the appraisal can run."
             )
             st.session_state["gemini_error_banner_shown"] = True
-
         st.session_state["gemini_last_error"] = str(e)
         return [_simple_kind_fallback(m) for m in matches]
 
+
 # ==========================================
-# 5. SERVICE: GOOGLE SHEETS EXPORT (3 COMPS SCHEMA)
+# 5. SCRAPING: PRICE / ESTIMATE EXTRACTION
+#    - Best-effort; some sites render price via JS or block bots.
+# ==========================================
+_MONEY_RE = re.compile(
+    r'(?:(?:USD|US\$)\s*)?\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)',
+    re.IGNORECASE
+)
+_RANGE_RE = re.compile(
+    r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)\s*(?:-|–|to)\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)',
+    re.IGNORECASE
+)
+
+def _to_number_string(x: str) -> str:
+    # Keep as string for Sheets/JSON; normalize commas
+    return x.replace(",", "").strip()
+
+def _extract_best_retail_price(text: str) -> str | None:
+    """
+    Picks the first plausible retail price from HTML text.
+    Conservative: choose the smallest of the first few amounts (often list pages include many prices).
+    """
+    vals = []
+    for m in _MONEY_RE.finditer(text):
+        amt = _to_number_string(m.group(1))
+        try:
+            vals.append(Decimal(amt))
+        except InvalidOperation:
+            continue
+        if len(vals) >= 12:
+            break
+    if not vals:
+        return None
+    # heuristic: choose median-ish of first values to avoid huge banner numbers
+    vals_sorted = sorted(vals)
+    mid = vals_sorted[len(vals_sorted)//2]
+    return f"${mid:,}".replace(",", ",")  # formatting keeps commas
+
+def _extract_estimate_range(text: str) -> tuple[str | None, str | None]:
+    """
+    Look for explicit $X - $Y ranges near 'estimate' keywords.
+    """
+    # focus around "estimate" occurrences
+    lowered = text.lower()
+    idx = lowered.find("estimate")
+    windows = []
+    if idx != -1:
+        windows.append(text[max(0, idx-2000): idx+2000])
+    # fallback: entire doc window (smaller)
+    windows.append(text[:120000])
+
+    for w in windows:
+        rm = _RANGE_RE.search(w)
+        if rm:
+            lo = "$" + rm.group(1)
+            hi = "$" + rm.group(2)
+            return lo, hi
+    return None, None
+
+def _extract_reserve(text: str) -> str | None:
+    """
+    Reserve is rare; try to find 'reserve' near a $ amount.
+    """
+    lowered = text.lower()
+    if "reserve" not in lowered:
+        return None
+    # find first reserve occurrence and search nearby for money
+    pos = lowered.find("reserve")
+    window = text[max(0, pos-1500): pos+1500]
+    m = _MONEY_RE.search(window)
+    if m:
+        return "$" + m.group(1)
+    return None
+
+def _fetch_html(url: str) -> str | None:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; NewelAppraiser/1.0; +https://newel.com)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
+        if r.status_code >= 400:
+            return None
+        # Some sites return huge HTML; cap to keep performance stable
+        return (r.text or "")[:250000]
+    except Exception:
+        return None
+
+def enrich_matches_with_scraped_prices(matches: list[dict], max_to_scrape: int = 6) -> list[dict]:
+    """
+    Best-effort scrape to populate numeric fields when missing.
+    - Only scrapes the first N matches per run (performance guardrail)
+    - Caches per session by URL
+    """
+    if "scrape_cache" not in st.session_state:
+        st.session_state["scrape_cache"] = {}
+
+    scraped = 0
+    for m in matches:
+        if scraped >= max_to_scrape:
+            break
+
+        url = (m.get("link") or "").strip()
+        if not url:
+            continue
+
+        # If already has required numbers, skip
+        if m.get("kind") == "auction":
+            if m.get("auction_low") is not None and m.get("auction_high") is not None and m.get("auction_reserve") is not None:
+                continue
+        if m.get("kind") == "retail":
+            if m.get("retail_price") is not None:
+                continue
+
+        if url in st.session_state["scrape_cache"]:
+            cached = st.session_state["scrape_cache"][url]
+            m.update(cached)
+            continue
+
+        html = _fetch_html(url)
+        if not html:
+            st.session_state["scrape_cache"][url] = {}
+            scraped += 1
+            continue
+
+        # Strip tags crudely for regex (cheap + effective)
+        text = re.sub(r"<script.*?>.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text)
+
+        update = {}
+        if m.get("kind") == "retail":
+            rp = _extract_best_retail_price(text)
+            if rp:
+                update["retail_price"] = rp
+
+        elif m.get("kind") == "auction":
+            lo, hi = _extract_estimate_range(text)
+            if lo or hi:
+                update["auction_low"] = lo
+                update["auction_high"] = hi
+            resv = _extract_reserve(text)
+            if resv:
+                update["auction_reserve"] = resv
+
+        st.session_state["scrape_cache"][url] = update
+        m.update(update)
+        scraped += 1
+
+    return matches
+
+
+# ==========================================
+# 6. GOOGLE SHEETS EXPORT (unchanged schema)
 # ==========================================
 def export_to_google_sheets(results: dict):
     sheet_id = _get_secret("GOOGLE_SHEET_ID")
@@ -367,23 +472,11 @@ def export_to_google_sheets(results: dict):
             timeout=30,
         )
 
-# ==========================================
-# 6. UI HELPERS
-# ==========================================
-def _container_border():
-    try:
-        return st.container(border=True)
-    except TypeError:
-        return st.container()
 
+# ==========================================
+# 7. UI RENDERER (native, clickable)
+# ==========================================
 def render_match_card_native(m: dict, kind_for_tab: str):
-    """
-    Bullet-proof renderer using ONLY Streamlit components.
-    Requirements:
-      - Auction tab: always show low/high/reserve for every listing
-      - Retail tab: always show retail_price for every listing
-      - Other tab: show confidence when present
-    """
     thumb = m.get("thumbnail") or ""
     title = m.get("title") or "Untitled"
     source = m.get("source") or "Unknown"
@@ -403,31 +496,25 @@ def render_match_card_native(m: dict, kind_for_tab: str):
             st.markdown(f"**{title}**")
             st.markdown(f"<span class='meta'>Source: {source}</span>", unsafe_allow_html=True)
 
-            # Required fields per tab
             if kind_for_tab == "auction":
-                low = _fmt_value(m.get("auction_low"))
-                high = _fmt_value(m.get("auction_high"))
-                reserve = _fmt_value(m.get("auction_reserve"))
                 st.markdown(
-                    f"<span class='pill'>Low Estimate: {low}</span>"
-                    f"<span class='pill'>High Estimate: {high}</span>"
-                    f"<span class='pill'>Auction Reserve: {reserve}</span>",
+                    f"<span class='pill'>Low Estimate: {_fmt_value(m.get('auction_low'))}</span>"
+                    f"<span class='pill'>High Estimate: {_fmt_value(m.get('auction_high'))}</span>"
+                    f"<span class='pill'>Auction Reserve: {_fmt_value(m.get('auction_reserve'))}</span>",
                     unsafe_allow_html=True,
                 )
-
             elif kind_for_tab == "retail":
-                rp = _fmt_value(m.get("retail_price"))
                 st.markdown(
-                    f"<span class='pill'>Retail Price: {rp}</span>",
+                    f"<span class='pill'>Retail Price: {_fmt_value(m.get('retail_price'))}</span>",
                     unsafe_allow_html=True,
                 )
-
             else:
-                conf = m.get("confidence")
-                if conf is not None:
-                    st.markdown(f"<span class='pill'>Confidence: {_fmt_value(conf)}</span>", unsafe_allow_html=True)
+                if m.get("confidence") is not None:
+                    st.markdown(
+                        f"<span class='pill'>Confidence: {_fmt_value(m.get('confidence'))}</span>",
+                        unsafe_allow_html=True,
+                    )
 
-            # Bullet-proof clickable link
             if link:
                 try:
                     st.link_button("View Listing", link, use_container_width=False)
@@ -436,19 +523,24 @@ def render_match_card_native(m: dict, kind_for_tab: str):
 
         st.markdown("</div>", unsafe_allow_html=True)
 
+
 # ==========================================
-# 7. UI MAIN
+# 8. SIDEBAR + MAIN UI
 # ==========================================
 with st.sidebar:
     st.markdown("<div class='newel-logo-text'>NEWEL</div>", unsafe_allow_html=True)
+
     st.toggle("Use Gemini classification", value=True, key="use_gemini")
+    # Scrape toggle: on by default so numbers show up when possible
+    st.toggle("Scrape prices from listing pages", value=True, key="use_scrape_prices")
+    st.slider("Max links to scrape per run", 0, 15, 6, key="max_scrape_links")
+
     st.divider()
     sku = st.session_state.get("uploaded_image_meta", {}).get("filename", "N/A")
     st.markdown(f"**SKU Label:** `{sku}`")
 
 st.markdown("<h1>Newel Appraiser</h1>", unsafe_allow_html=True)
 
-# 1. Upload
 st.header("1. Upload Item Image")
 uploaded_file = st.file_uploader("Upload item photo for appraisal", type=["jpg", "jpeg", "png"])
 
@@ -457,7 +549,6 @@ if uploaded_file:
     st.session_state["uploaded_image_meta"] = {"filename": uploaded_file.name, "content_type": uploaded_file.type}
     st.image(uploaded_file, width=420)
 
-# 2. Run Appraisal
 st.header("2. Run Appraisal")
 if st.button("Run Appraisal", disabled=not uploaded_file):
     with st.spinner("Processing..."):
@@ -498,15 +589,24 @@ if st.button("Run Appraisal", disabled=not uploaded_file):
             for i in lens.get("visual_matches", [])[:15]
         ]
 
+        # Classify (Gemini if available; else fallback)
+        top_matches = upgrade_comps_with_gemini(raw_matches)
+
+        # Scrape numbers (best-effort) so pricing fields populate without Gemini
+        if st.session_state.get("use_scrape_prices", True):
+            top_matches = enrich_matches_with_scraped_prices(
+                top_matches,
+                max_to_scrape=int(st.session_state.get("max_scrape_links", 6)),
+            )
+
         st.session_state["results"] = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "traceability": {
                 "s3": {"presigned_url": url},
-                "search_summary": {"top_matches": upgrade_comps_with_gemini(raw_matches)},
+                "search_summary": {"top_matches": top_matches},
             },
         }
 
-# 3. Results
 st.header("3. Results")
 res = st.session_state.get("results")
 if not res:
