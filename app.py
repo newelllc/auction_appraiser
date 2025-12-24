@@ -9,16 +9,12 @@ from datetime import datetime
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 
-# ==========================================
-# 1. PAGE CONFIG & NEUTRAL BRANDING
-# ==========================================
 st.set_page_config(page_title="Newel Appraiser MVP", layout="wide")
 
 def apply_newel_branding():
     st.markdown("""
         <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,700;1,400;1,700&display=swap" rel="stylesheet">
         <style>
-        /* Global Reset */
         .stApp {
             background-color: #FBF5EB !important;
             font-family: 'EB Garamond', serif !important;
@@ -27,8 +23,6 @@ def apply_newel_branding():
             color: #1C1C1E !important;
             font-family: 'EB Garamond', serif !important;
         }
-
-        /* Sidebar Branding */
         [data-testid="stSidebar"] {
             background-color: #F8F2E8 !important;
             border-right: 1px solid #C2C2C2;
@@ -39,19 +33,14 @@ def apply_newel_branding():
             font-weight: 700;
             text-align: center;
             letter-spacing: 0.15em;
-            margin-bottom: 0px;
             text-transform: uppercase;
         }
-
-        /* Headers - Newel Red */
         h1, h2, h3, .brand-header {
             color: #8B0000 !important;
             text-transform: uppercase;
             letter-spacing: 0.12em;
             font-weight: 700 !important;
         }
-
-        /* Primary Action Buttons (Rectangular Black) */
         div.stButton > button {
             background-color: #1C1C1E !important;
             color: #FBF5EB !important;
@@ -67,21 +56,16 @@ def apply_newel_branding():
             background-color: #8B0000 !important;
             color: #FBF5EB !important;
         }
-
-        /* File Uploader Clean-up */
         [data-testid="stFileUploader"] { background-color: transparent !important; }
         [data-testid="stFileUploader"] section {
             background-color: #FBF5EB !important;
             border: 1px dashed #C2C2C2 !important;
         }
-
-        /* Results Display */
         .result-card {
             background-color: white !important;
             padding: 24px;
             border: 1px solid #C2C2C2;
             margin-bottom: 18px;
-            border-radius: 0px;
         }
         .pill {
             background-color: #EFDAAC !important;
@@ -103,18 +87,12 @@ def apply_newel_branding():
 
 apply_newel_branding()
 
-# ==========================================
-# 2. CORE UTILITIES
-# ==========================================
 def _get_secret(name: str) -> str:
     if name in st.secrets: return str(st.secrets[name])
     val = os.getenv(name)
     if not val: raise RuntimeError(f"Missing required secret: {name}")
     return val
 
-# ==========================================
-# 3. SERVICE: GEMINI CLASSIFICATION
-# ==========================================
 def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
     genai.configure(api_key=_get_secret("GEMINI_API_KEY"))
     model = genai.GenerativeModel("gemini-2.0-flash")
@@ -127,22 +105,17 @@ def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
             if i < len(ai_data): m.update(ai_data[i])
         return matches
     except Exception as e:
-        st.error(f"AI Classification Error: {e}")
+        st.error(f"AI Error")
         return matches
 
-# ==========================================
-# 4. SERVICE: EXPORT
-# ==========================================
 def export_to_google_sheets(results: dict):
     sheet_id = _get_secret("GOOGLE_SHEET_ID")
     trace = results.get("traceability", {})
     matches = trace.get("search_summary", {}).get("top_matches", [])
     img_url = trace.get("s3", {}).get("presigned_url", "")
     ts = results.get("timestamp")
-
     auctions = [m for m in matches if m.get("kind") == "auction"][:3]
     retails = [m for m in matches if m.get("kind") == "retail"][:3]
-
     def build_row(items, is_auc):
         row = [ts, f'=IMAGE("{img_url}")', img_url]
         for i in range(3):
@@ -153,19 +126,14 @@ def export_to_google_sheets(results: dict):
                 else: row.append(m.get("retail_price"))
             else: row.extend([""] * (5 if is_auc else 3))
         return row
-
     sa_info = st.secrets["google_service_account"]
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     creds.refresh(Request())
-
     for tab, items, is_auc in [("Auction", auctions, True), ("Retail", retails, False)]:
         requests.post(f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab}!A:Z:append",
                       params={"valueInputOption": "USER_ENTERED"}, headers={"Authorization": f"Bearer {creds.token}"},
                       json={"values": [build_row(items, is_auc)]}, timeout=30)
 
-# ==========================================
-# 5. UI COMPONENTS
-# ==========================================
 with st.sidebar:
     st.markdown("<div class='sidebar-logo'>NEWEL</div>", unsafe_allow_html=True)
     st.divider()
@@ -177,7 +145,6 @@ with st.sidebar:
 
 st.markdown("<h1 class='brand-header'>Newel Appraiser</h1>", unsafe_allow_html=True)
 
-# 1. Upload
 st.header("1. Upload Item Image")
 uploaded_file = st.file_uploader("Upload item photo for appraisal", type=["jpg", "jpeg", "png"])
 
@@ -186,35 +153,30 @@ if uploaded_file:
     st.session_state["uploaded_image_meta"] = {"filename": uploaded_file.name, "content_type": uploaded_file.type}
     st.image(uploaded_file, width=420)
 
-# 2. Run
 st.header("2. Run Appraisal")
 if st.button("RUN APPRAISAL", disabled=not uploaded_file):
-    with st.spinner("Analyzing visually and classifying sources..."):
+    with st.spinner("Processing..."):
         s3 = boto3.client("s3", region_name=_get_secret("AWS_REGION"), 
                           aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"), 
                           aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"))
         key = f"uploads/{uuid.uuid4().hex}_{uploaded_file.name}"
         s3.put_object(Bucket=_get_secret("S3_BUCKET"), Key=key, Body=st.session_state["uploaded_image_bytes"], ContentType=st.session_state["uploaded_image_meta"]["content_type"])
         url = s3.generate_presigned_url("get_object", Params={"Bucket": _get_secret("S3_BUCKET"), "Key": key}, ExpiresIn=3600)
-
         lens = requests.get("https://serpapi.com/search.json", params={"engine": "google_lens", "url": url, "api_key": _get_secret("SERPAPI_API_KEY")}).json()
         raw_matches = [{"title": i.get("title"), "source": i.get("source"), "link": i.get("link"), "thumbnail": i.get("thumbnail")} for i in lens.get("visual_matches", [])[:15]]
-
         st.session_state["results"] = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "traceability": {"s3": {"presigned_url": url}, "search_summary": {"top_matches": upgrade_comps_with_gemini(raw_matches)}},
         }
 
-# 3. Results
 st.header("3. Results")
 res = st.session_state.get("results")
 if res:
     matches = res["traceability"]["search_summary"]["top_matches"]
     t_auc, t_ret, t_misc = st.tabs(["Auction Results", "Retail Listings", "Other Matches"])
-
     def render_cards(subset, is_priced):
         if not subset:
-            st.info("No relevant matches found in this category.")
+            st.info("No matches found.")
             return
         for m in subset:
             auc_pill = f"<div class='pill'>Low: {m.get('auction_low')} | High: {m.get('auction_high')}</div>" if is_priced and m.get("auction_low") else ""
@@ -232,17 +194,15 @@ if res:
                   </div>
                 </div>
             """, unsafe_allow_html=True)
-
     with t_auc: render_cards([m for m in matches if m.get("kind") == "auction"], True)
     with t_ret: render_cards([m for m in matches if m.get("kind") == "retail"], True)
     with t_misc: render_cards([m for m in matches if m.get("kind") not in ("auction", "retail")], False)
-
     if st.button("🚀 EXPORT TO MASTER GOOGLE SHEET"):
-        with st.spinner("Processing spreadsheet append..."):
+        with st.spinner("Processing..."):
             try:
                 export_to_google_sheets(res)
-                st.toast("Success: Row Appended")
+                st.toast("Success")
                 st.markdown(f"[VIEW MASTER TRACKING SHEET]({_get_secret('GOOGLE_SHEET_URL')})")
-            except Exception as e: st.error(f"Spreadsheet Export Failed: {e}")
+            except Exception as e: st.error(f"Export Failed")
 else:
     st.info("No appraisal run yet. Upload a photo above to begin.")
