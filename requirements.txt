@@ -1,4 +1,6 @@
 streamlit
+openai
 boto3
 requests
 google-auth
+google-api-python-client
