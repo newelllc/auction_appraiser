@@ -20,186 +20,45 @@ st.set_page_config(page_title="Newel Appraiser MVP", layout="wide")
 # 2. BRAND STYLES (INJECT VIA components.html)
 #    (Prevents CSS from appearing as text in Streamlit)
 # ==========================================
-def apply_newel_branding():
-    css = """
-<link href="https://fonts.googleapis.com/css2?family=EB+Garamond:wght@400;600;700&display=swap" rel="stylesheet">
-<style>
-/* ========= Brand palette ========= */
-:root{
-  --newel-ivory: #FBF5EB;
-  --newel-ivory-2:#F6EFE4;
-  --newel-text: #1C1C1E;
-  --newel-muted:#4A4A4F;
-  --newel-border:#CFC7BC;
-  --newel-burgundy:#5A0B1B;
-  --newel-burgundy-2:#7A0F24;
-  --newel-gold:#EFDAAC;
-  --newel-card:#FFFFFF;
-}
+import streamlit.components.v1 as components
 
-/* ========= Force LIGHT app containers ========= */
-html, body {
-  background: var(--newel-ivory) !important;
-}
+def force_light_mode_shell():
+    components.html(
+        """
+        <meta name="color-scheme" content="light">
+        <style>
+          :root { color-scheme: light !important; }
+          html, body, .stApp { background: #FBF5EB !important; }
 
-.stApp {
-  background: var(--newel-ivory) !important;
-  font-family: 'EB Garamond', serif !important;
-}
+          /* Streamlit chrome/header/toolbars */
+          [data-testid="stHeader"],
+          [data-testid="stToolbar"],
+          header {
+            background: #FBF5EB !important;
+          }
 
-/* Main app view container */
-[data-testid="stAppViewContainer"] {
-  background: var(--newel-ivory) !important;
-}
-[data-testid="stMain"] {
-  background: var(--newel-ivory) !important;
-}
+          /* Main containers */
+          [data-testid="stAppViewContainer"],
+          [data-testid="stMain"],
+          section.main {
+            background: #FBF5EB !important;
+          }
 
-/* Ensure all text is readable (override dark theme defaults) */
-.stApp, .stApp * {
-  color: var(--newel-text) !important;
-  font-family: 'EB Garamond', serif !important;
-}
+          /* Sidebar */
+          section[data-testid="stSidebar"]{
+            background: #F6EFE4 !important;
+          }
 
-/* Markdown text blocks */
-[data-testid="stMarkdownContainer"] p,
-[data-testid="stMarkdownContainer"] span,
-[data-testid="stMarkdownContainer"] li {
-  color: var(--newel-text) !important;
-}
+          /* Force readable text globally */
+          .stApp, .stApp * { color: #1C1C1E !important; }
+        </style>
+        """,
+        height=0,
+        scrolling=False,
+    )
 
-/* ========= Sidebar ========= */
-section[data-testid="stSidebar"] {
-  background: var(--newel-ivory-2) !important;
-  border-right: 1px solid var(--newel-border) !important;
-}
-section[data-testid="stSidebar"] * {
-  color: var(--newel-text) !important;
-}
+force_light_mode_shell()
 
-/* ========= Headings (burgundy, uppercase, spaced) ========= */
-h1, h2, h3 {
-  color: var(--newel-burgundy) !important;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  font-weight: 700 !important;
-}
-h1 { font-size: 2.25rem !important; margin-bottom: 0.25rem !important; }
-h2 { font-size: 1.6rem !important; margin-top: 1.25rem !important; }
-h3 { font-size: 1.25rem !important; }
-
-/* ========= NEWEL logo text (bigger) ========= */
-.newel-logo-text {
-  font-family: 'EB Garamond', serif !important;
-  font-weight: 700 !important;
-  font-size: 3.4rem !important;
-  letter-spacing: 0.16em !important;
-  line-height: 1.0 !important;
-  color: var(--newel-burgundy) !important;
-  margin: 0.25rem 0 0.8rem 0 !important;
-}
-
-/* ========= Dividers ========= */
-hr, [data-testid="stDivider"] {
-  border-color: var(--newel-border) !important;
-}
-
-/* ========= Inputs / uploader ========= */
-[data-testid="stFileUploader"] section {
-  background: var(--newel-card) !important;
-  border: 1px solid var(--newel-border) !important;
-  border-radius: 14px !important;
-}
-[data-testid="stFileUploader"] * {
-  color: var(--newel-text) !important;
-}
-
-/* Make the drag-drop area readable */
-[data-testid="stFileUploaderDropzone"] {
-  background: var(--newel-card) !important;
-  border: 1px dashed var(--newel-border) !important;
-  border-radius: 14px !important;
-}
-[data-testid="stFileUploaderDropzone"] * {
-  color: var(--newel-text) !important;
-}
-
-/* ========= Buttons (burgundy fill, ivory text) ========= */
-div.stButton > button {
-  background: var(--newel-burgundy) !important;
-  color: var(--newel-ivory) !important;
-  border: none !important;
-  border-radius: 0px !important; /* matches your flat brand buttons */
-  padding: 0.9rem 1.25rem !important;
-  font-weight: 700 !important;
-  letter-spacing: 0.12em !important;
-  text-transform: uppercase !important;
-  width: 100% !important;
-}
-div.stButton > button:hover {
-  background: var(--newel-burgundy-2) !important;
-  color: var(--newel-ivory) !important;
-}
-
-/* ========= Tabs ========= */
-.stTabs [data-baseweb="tab"] {
-  font-weight: 700 !important;
-  letter-spacing: 0.08em !important;
-  text-transform: uppercase !important;
-  color: var(--newel-text) !important;
-}
-.stTabs [data-baseweb="tab"][aria-selected="true"] {
-  color: var(--newel-burgundy) !important;
-}
-
-/* ========= Result card ========= */
-.result-card {
-  background: var(--newel-card) !important;
-  border: 1px solid var(--newel-border) !important;
-  border-radius: 16px !important;
-  padding: 1.1rem 1.1rem !important;
-  margin-bottom: 1rem !important;
-}
-.result-title {
-  font-size: 1.15rem !important;
-  font-weight: 700 !important;
-  color: var(--newel-text) !important;
-}
-.result-meta {
-  color: var(--newel-muted) !important;
-  font-size: 0.95rem !important;
-}
-
-/* Pills */
-.pill {
-  background: var(--newel-gold) !important;
-  color: var(--newel-text) !important;
-  padding: 6px 10px !important;
-  border-radius: 999px !important;
-  display: inline-block !important;
-  font-weight: 700 !important;
-  margin-top: 8px !important;
-}
-
-/* Links */
-a, a:link, a:visited {
-  color: var(--newel-burgundy) !important;
-  font-weight: 700 !important;
-  text-decoration: none !important;
-}
-a:hover { text-decoration: underline !important; }
-
-/* Alerts/info boxes readable */
-[data-testid="stAlert"] {
-  border-radius: 12px !important;
-}
-</style>
-"""
-    # Height 0 so nothing visual appears; styles apply globally
-    components.html(css, height=0, scrolling=False)
-
-
-apply_newel_branding()
 
 
 # ==========================================
