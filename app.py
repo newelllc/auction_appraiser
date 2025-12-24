@@ -184,14 +184,6 @@ button:hover, .stButton>button:hover {
   font-size: 0.95rem !important;
 }
 
-/* Links (non-button) */
-a, a:link, a:visited {
-  color: var(--burgundy) !important;
-  font-weight: 700 !important;
-  text-decoration: none !important;
-}
-a:hover { text-decoration: underline !important; }
-
 /* Alerts/info boxes */
 [data-testid="stAlert"] {
   border-radius: 12px !important;
@@ -214,6 +206,13 @@ def _get_secret(name: str) -> str:
     if not val:
         raise RuntimeError(f"Missing required secret: {name}")
     return val
+
+def _fmt_value(v) -> str:
+    """Always show something for required fields."""
+    if v is None:
+        return "—"
+    s = str(v).strip()
+    return s if s else "—"
 
 # ==========================================
 # 4. GEMINI: FALLBACK + CACHING (NO QUOTA = KEEP RUNNING)
@@ -372,21 +371,18 @@ def export_to_google_sheets(results: dict):
 # 6. UI HELPERS
 # ==========================================
 def _container_border():
-    """
-    Bullet-proof container with border:
-    - uses st.container(border=True) if available
-    - otherwise falls back to plain st.container()
-    """
     try:
         return st.container(border=True)
     except TypeError:
         return st.container()
 
-def render_match_card_native(m: dict, show_prices: bool):
+def render_match_card_native(m: dict, kind_for_tab: str):
     """
-    Bullet-proof card renderer using ONLY Streamlit components.
-    No custom HTML nesting => no HTML showing as text.
-    Clickable link rendered via st.link_button().
+    Bullet-proof renderer using ONLY Streamlit components.
+    Requirements:
+      - Auction tab: always show low/high/reserve for every listing
+      - Retail tab: always show retail_price for every listing
+      - Other tab: show confidence when present
     """
     thumb = m.get("thumbnail") or ""
     title = m.get("title") or "Untitled"
@@ -394,8 +390,6 @@ def render_match_card_native(m: dict, show_prices: bool):
     link = m.get("link") or ""
 
     with _container_border():
-        # Add class-like styling by wrapping a lightweight HTML div just for padding/background
-        # (contains no nested HTML content, so nothing can "print as text")
         st.markdown('<div class="result-card">', unsafe_allow_html=True)
 
         c1, c2 = st.columns([1, 6], gap="medium")
@@ -409,33 +403,38 @@ def render_match_card_native(m: dict, show_prices: bool):
             st.markdown(f"**{title}**")
             st.markdown(f"<span class='meta'>Source: {source}</span>", unsafe_allow_html=True)
 
-            if show_prices:
-                if m.get("auction_low") is not None or m.get("auction_high") is not None:
-                    st.markdown(
-                        f"<span class='pill'>Low: {m.get('auction_low')}</span>"
-                        f"<span class='pill'>High: {m.get('auction_high')}</span>",
-                        unsafe_allow_html=True,
-                    )
-                if m.get("retail_price") is not None:
-                    st.markdown(
-                        f"<span class='pill'>Retail Price: {m.get('retail_price')}</span>",
-                        unsafe_allow_html=True,
-                    )
+            # Required fields per tab
+            if kind_for_tab == "auction":
+                low = _fmt_value(m.get("auction_low"))
+                high = _fmt_value(m.get("auction_high"))
+                reserve = _fmt_value(m.get("auction_reserve"))
+                st.markdown(
+                    f"<span class='pill'>Low Estimate: {low}</span>"
+                    f"<span class='pill'>High Estimate: {high}</span>"
+                    f"<span class='pill'>Auction Reserve: {reserve}</span>",
+                    unsafe_allow_html=True,
+                )
+
+            elif kind_for_tab == "retail":
+                rp = _fmt_value(m.get("retail_price"))
+                st.markdown(
+                    f"<span class='pill'>Retail Price: {rp}</span>",
+                    unsafe_allow_html=True,
+                )
+
             else:
                 conf = m.get("confidence")
                 if conf is not None:
-                    st.markdown(f"<span class='pill'>Confidence: {conf}</span>", unsafe_allow_html=True)
+                    st.markdown(f"<span class='pill'>Confidence: {_fmt_value(conf)}</span>", unsafe_allow_html=True)
 
-            # ✅ Bullet-proof clickable link (Streamlit renders a real anchor/button)
+            # Bullet-proof clickable link
             if link:
                 try:
                     st.link_button("View Listing", link, use_container_width=False)
                 except TypeError:
-                    # Older Streamlit fallback (still clickable)
                     st.markdown(f"[VIEW LISTING]({link})")
 
         st.markdown("</div>", unsafe_allow_html=True)
-
 
 # ==========================================
 # 7. UI MAIN
@@ -521,21 +520,21 @@ else:
         if not subset:
             st.info("No auction matches found.")
         for m in subset:
-            render_match_card_native(m, show_prices=True)
+            render_match_card_native(m, kind_for_tab="auction")
 
     with t_ret:
         subset = [m for m in matches if m.get("kind") == "retail"]
         if not subset:
             st.info("No retail matches found.")
         for m in subset:
-            render_match_card_native(m, show_prices=True)
+            render_match_card_native(m, kind_for_tab="retail")
 
     with t_misc:
         subset = [m for m in matches if m.get("kind") not in ("auction", "retail")]
         if not subset:
             st.info("No other matches.")
         for m in subset:
-            render_match_card_native(m, show_prices=False)
+            render_match_card_native(m, kind_for_tab="other")
 
     if st.button("Export to Google Sheets"):
         with st.spinner("Exporting rows..."):
