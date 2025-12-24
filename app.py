@@ -11,6 +11,7 @@ from datetime import datetime
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 import streamlit.components.v1 as components
+import textwrap
 
 # ==========================================
 # 1. PAGE CONFIG
@@ -267,7 +268,6 @@ def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
     if "gemini_error_banner_shown" not in st.session_state:
         st.session_state["gemini_error_banner_shown"] = False
 
-    # Toggle allows staff to run without Gemini
     use_gemini = st.session_state.get("use_gemini", True)
     if not use_gemini:
         return [_simple_kind_fallback(m) for m in matches]
@@ -280,7 +280,6 @@ def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
         for i, m in enumerate(matches):
             if i < len(cached):
                 m.update(cached[i])
-            # ensure keys exist
             m.setdefault("kind", "other")
             m.setdefault("confidence", None)
             m.setdefault("auction_low", None)
@@ -300,9 +299,8 @@ Data: {json.dumps(payload)}
 Return ONLY a JSON object with a key "results" containing the ordered list of objects.
 """
 
-        # Keep retries short; quota=0 will always fail, but transient 429s may pass.
         last_err = None
-        for attempt in range(2):
+        for _attempt in range(2):
             try:
                 response = model.generate_content(
                     prompt,
@@ -386,7 +384,6 @@ def export_to_google_sheets(results: dict):
 with st.sidebar:
     st.markdown("<div class='newel-logo-text'>NEWEL</div>", unsafe_allow_html=True)
 
-    # Optional: allow disabling Gemini when quota is dead
     st.toggle("Use Gemini classification", value=True, key="use_gemini")
 
     st.divider()
@@ -463,11 +460,12 @@ else:
     t_auc, t_ret, t_misc = st.tabs(["Auction Results", "Retail Listings", "Other Matches"])
 
     def render_match_card(m: dict, show_prices: bool):
-        thumb = m.get("thumbnail", "")
+        thumb = m.get("thumbnail") or ""
         title = m.get("title") or "Untitled"
         source = m.get("source") or "Unknown"
         link = m.get("link") or ""
 
+        # Pills
         auc_pill = ""
         if show_prices and (m.get("auction_low") is not None or m.get("auction_high") is not None):
             auc_pill = (
@@ -480,13 +478,13 @@ else:
         if show_prices and (m.get("retail_price") is not None):
             ret_pill = f"<div class='pill'>Retail Price: {m.get('retail_price')}</div>"
 
-        conf = m.get("confidence")
         conf_pill = ""
-        if (not show_prices) and conf is not None:
+        conf = m.get("confidence")
+        if (not show_prices) and (conf is not None):
             conf_pill = f"<div class='pill'>Confidence: {conf}</div>"
 
-        st.markdown(
-            f"""
+        # IMPORTANT: no leading indentation => no markdown code block
+        html = f"""
 <div class="result-card">
   <div style="display:flex; gap:16px; align-items:flex-start;">
     <div style="width:110px; flex:0 0 110px;">
@@ -500,14 +498,13 @@ else:
       {ret_pill}
       {conf_pill}
       <div style="margin-top:10px;">
-        <a href="{link}" target="_blank">VIEW LISTING</a>
+        <a href="{link}" target="_blank" rel="noopener noreferrer">VIEW LISTING</a>
       </div>
     </div>
   </div>
 </div>
-            """,
-            unsafe_allow_html=True,
-        )
+"""
+        st.markdown(textwrap.dedent(html).strip(), unsafe_allow_html=True)
 
     with t_auc:
         subset = [m for m in matches if m.get("kind") == "auction"]
