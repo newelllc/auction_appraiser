@@ -1,6 +1,5 @@
 streamlit
-openai
+google-generativeai
 boto3
 requests
 google-auth
-google-api-python-client
