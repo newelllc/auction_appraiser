@@ -11,7 +11,6 @@ from datetime import datetime
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 import streamlit.components.v1 as components
-import textwrap
 
 # ==========================================
 # 1. PAGE CONFIG
@@ -21,7 +20,7 @@ st.set_page_config(page_title="Newel Appraiser MVP", layout="wide")
 # ==========================================
 # 2. BRAND / UI STYLES
 #    - Light background + readable text
-#    - ALL buttons red w/ white text (includes Browse files)
+#    - ALL buttons red w/ white text (includes Browse files + link_button)
 #    - Larger NEWEL logo (no EST 1939)
 # ==========================================
 def apply_newel_branding():
@@ -130,7 +129,8 @@ hr, [data-testid="stDivider"]{
 
 /* ====== ALL BUTTONS: RED with WHITE text ======
    - Streamlit buttons
-   - "Browse files" button in uploader is also a <button>
+   - "Browse files" uploader button
+   - st.link_button button
 */
 button, .stButton>button {
   background-color: var(--btn) !important;
@@ -157,21 +157,13 @@ button:hover, .stButton>button:hover {
   color: var(--burgundy) !important;
 }
 
-/* Result cards */
+/* Result "card" styling for native containers */
 .result-card {
   background: var(--card) !important;
   border: 1px solid var(--border) !important;
   border-radius: 16px !important;
-  padding: 1.1rem 1.1rem !important;
-  margin-bottom: 1rem !important;
-}
-.result-title {
-  font-size: 1.15rem !important;
-  font-weight: 700 !important;
-}
-.result-meta {
-  color: var(--muted) !important;
-  font-size: 0.95rem !important;
+  padding: 14px 14px !important;
+  margin-bottom: 14px !important;
 }
 
 /* Pills */
@@ -183,9 +175,16 @@ button:hover, .stButton>button:hover {
   font-weight: 700 !important;
   display: inline-block !important;
   margin-top: 8px !important;
+  margin-right: 8px !important;
 }
 
-/* Links */
+/* Small meta text */
+.meta {
+  color: var(--muted) !important;
+  font-size: 0.95rem !important;
+}
+
+/* Links (non-button) */
 a, a:link, a:visited {
   color: var(--burgundy) !important;
   font-weight: 700 !important;
@@ -220,10 +219,6 @@ def _get_secret(name: str) -> str:
 # 4. GEMINI: FALLBACK + CACHING (NO QUOTA = KEEP RUNNING)
 # ==========================================
 def _simple_kind_fallback(match: dict) -> dict:
-    """
-    Heuristic fallback when Gemini is unavailable.
-    Ensures keys exist so downstream UI/export doesn't break.
-    """
     title = (match.get("title") or "").lower()
     source = (match.get("source") or "").lower()
     link = (match.get("link") or "").lower()
@@ -258,11 +253,6 @@ def _simple_kind_fallback(match: dict) -> dict:
     return match
 
 def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
-    """
-    Calls Gemini to classify matches.
-    If Gemini quota/rate-limit fails, falls back to heuristic classification.
-    Also caches to avoid repeated calls.
-    """
     if "gemini_cache" not in st.session_state:
         st.session_state["gemini_cache"] = {}
     if "gemini_error_banner_shown" not in st.session_state:
@@ -379,13 +369,80 @@ def export_to_google_sheets(results: dict):
         )
 
 # ==========================================
-# 6. UI MAIN
+# 6. UI HELPERS
+# ==========================================
+def _container_border():
+    """
+    Bullet-proof container with border:
+    - uses st.container(border=True) if available
+    - otherwise falls back to plain st.container()
+    """
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
+
+def render_match_card_native(m: dict, show_prices: bool):
+    """
+    Bullet-proof card renderer using ONLY Streamlit components.
+    No custom HTML nesting => no HTML showing as text.
+    Clickable link rendered via st.link_button().
+    """
+    thumb = m.get("thumbnail") or ""
+    title = m.get("title") or "Untitled"
+    source = m.get("source") or "Unknown"
+    link = m.get("link") or ""
+
+    with _container_border():
+        # Add class-like styling by wrapping a lightweight HTML div just for padding/background
+        # (contains no nested HTML content, so nothing can "print as text")
+        st.markdown('<div class="result-card">', unsafe_allow_html=True)
+
+        c1, c2 = st.columns([1, 6], gap="medium")
+        with c1:
+            if thumb:
+                st.image(thumb, width=110)
+            else:
+                st.write("")
+
+        with c2:
+            st.markdown(f"**{title}**")
+            st.markdown(f"<span class='meta'>Source: {source}</span>", unsafe_allow_html=True)
+
+            if show_prices:
+                if m.get("auction_low") is not None or m.get("auction_high") is not None:
+                    st.markdown(
+                        f"<span class='pill'>Low: {m.get('auction_low')}</span>"
+                        f"<span class='pill'>High: {m.get('auction_high')}</span>",
+                        unsafe_allow_html=True,
+                    )
+                if m.get("retail_price") is not None:
+                    st.markdown(
+                        f"<span class='pill'>Retail Price: {m.get('retail_price')}</span>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                conf = m.get("confidence")
+                if conf is not None:
+                    st.markdown(f"<span class='pill'>Confidence: {conf}</span>", unsafe_allow_html=True)
+
+            # ✅ Bullet-proof clickable link (Streamlit renders a real anchor/button)
+            if link:
+                try:
+                    st.link_button("View Listing", link, use_container_width=False)
+                except TypeError:
+                    # Older Streamlit fallback (still clickable)
+                    st.markdown(f"[VIEW LISTING]({link})")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ==========================================
+# 7. UI MAIN
 # ==========================================
 with st.sidebar:
     st.markdown("<div class='newel-logo-text'>NEWEL</div>", unsafe_allow_html=True)
-
     st.toggle("Use Gemini classification", value=True, key="use_gemini")
-
     st.divider()
     sku = st.session_state.get("uploaded_image_meta", {}).get("filename", "N/A")
     st.markdown(f"**SKU Label:** `{sku}`")
@@ -459,73 +516,26 @@ else:
     matches = res["traceability"]["search_summary"]["top_matches"]
     t_auc, t_ret, t_misc = st.tabs(["Auction Results", "Retail Listings", "Other Matches"])
 
-    def render_match_card(m: dict, show_prices: bool):
-        thumb = m.get("thumbnail") or ""
-        title = m.get("title") or "Untitled"
-        source = m.get("source") or "Unknown"
-        link = m.get("link") or ""
-
-        # Pills
-        auc_pill = ""
-        if show_prices and (m.get("auction_low") is not None or m.get("auction_high") is not None):
-            auc_pill = (
-                "<div class='pill'>"
-                f"Low: {m.get('auction_low')} &nbsp; | &nbsp; High: {m.get('auction_high')}"
-                "</div>"
-            )
-
-        ret_pill = ""
-        if show_prices and (m.get("retail_price") is not None):
-            ret_pill = f"<div class='pill'>Retail Price: {m.get('retail_price')}</div>"
-
-        conf_pill = ""
-        conf = m.get("confidence")
-        if (not show_prices) and (conf is not None):
-            conf_pill = f"<div class='pill'>Confidence: {conf}</div>"
-
-        # IMPORTANT: no leading indentation => no markdown code block
-        html = f"""
-<div class="result-card">
-  <div style="display:flex; gap:16px; align-items:flex-start;">
-    <div style="width:110px; flex:0 0 110px;">
-      <img src="{thumb}" width="110"
-           style="object-fit:contain; border:1px solid #CFC7BC; border-radius:12px; background:#FFF;" />
-    </div>
-    <div style="flex:1;">
-      <div class="result-title">{title}</div>
-      <div class="result-meta">Source: {source}</div>
-      {auc_pill}
-      {ret_pill}
-      {conf_pill}
-      <div style="margin-top:10px;">
-        <a href="{link}" target="_blank" rel="noopener noreferrer">VIEW LISTING</a>
-      </div>
-    </div>
-  </div>
-</div>
-"""
-        st.markdown(textwrap.dedent(html).strip(), unsafe_allow_html=True)
-
     with t_auc:
         subset = [m for m in matches if m.get("kind") == "auction"]
         if not subset:
             st.info("No auction matches found.")
         for m in subset:
-            render_match_card(m, show_prices=True)
+            render_match_card_native(m, show_prices=True)
 
     with t_ret:
         subset = [m for m in matches if m.get("kind") == "retail"]
         if not subset:
             st.info("No retail matches found.")
         for m in subset:
-            render_match_card(m, show_prices=True)
+            render_match_card_native(m, show_prices=True)
 
     with t_misc:
         subset = [m for m in matches if m.get("kind") not in ("auction", "retail")]
         if not subset:
             st.info("No other matches.")
         for m in subset:
-            render_match_card(m, show_prices=False)
+            render_match_card_native(m, show_prices=False)
 
     if st.button("Export to Google Sheets"):
         with st.spinner("Exporting rows..."):
