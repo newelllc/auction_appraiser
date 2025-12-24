@@ -10,7 +10,7 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 
 # ==========================================
-# 1. PAGE CONFIG & NEWEL BRANDING [cite: 203, 254]
+# 1. PAGE CONFIG & NEWEL BRANDING
 # ==========================================
 st.set_page_config(page_title="Newel Appraiser MVP", layout="wide")
 
@@ -31,7 +31,7 @@ def apply_newel_branding():
 apply_newel_branding()
 
 # ==========================================
-# 2. CORE UTILITIES [cite: 97, 105]
+# 2. CORE UTILITIES
 # ==========================================
 def _get_secret(name: str) -> str:
     if name in st.secrets: return str(st.secrets[name])
@@ -40,16 +40,19 @@ def _get_secret(name: str) -> str:
     return val
 
 # ==========================================
-# 3. SERVICE: GEMINI CLASSIFICATION [cite: 13, 140, 146]
+# 3. SERVICE: GEMINI CLASSIFICATION (STABLE 2.5 FLASH)
 # ==========================================
 def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
+    # Configure using the GEMINI_API_KEY environment variable/secret
     genai.configure(api_key=_get_secret("GEMINI_API_KEY"))
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    # Use the 2025 stable flash model
+    model = genai.GenerativeModel('gemini-2.5-flash')
     
     context = [{"title": m["title"], "source": m["source"], "link": m["link"]} for m in matches]
     prompt = f"""
     You are an antique furniture appraisal expert. Classify these matches into "auction" or "retail".
-    Extract: kind (auction/retail), confidence (0-1), auction_low, auction_high, auction_reserve, retail_price.
+    Extract: kind (auction/retail), confidence (0.0-1.0), auction_low, auction_high, auction_reserve, retail_price.
     Input Data: {json.dumps(context)}
     Return ONLY a JSON object with a key "results" containing the ordered list of objects.
     """
@@ -61,11 +64,11 @@ def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
             if i < len(ai_data): match.update(ai_data[i])
         return matches
     except Exception as e:
-        st.error(f"Gemini AI Error: {e}")
+        st.error(f"Gemini AI Classification Error: {e}")
         return matches
 
 # ==========================================
-# 4. SERVICE: EXPORT [cite: 23, 154]
+# 4. SERVICE: EXPORT (Analyst-Friendly Schema)
 # ==========================================
 def export_to_google_sheets(results: dict):
     sheet_id = _get_secret("GOOGLE_SHEET_ID")
@@ -97,14 +100,14 @@ def export_to_google_sheets(results: dict):
                       json={"values": [build_row(items, is_auc)]}, timeout=30)
 
 # ==========================================
-# 5. UI MAIN [cite: 127, 158]
+# 5. UI MAIN
 # ==========================================
 with st.sidebar:
     st.markdown("<h2 class='brand-header'>Newel Appraiser</h2>", unsafe_allow_html=True)
     if os.path.exists("logo.png"): st.image("logo.png", use_container_width=True)
     st.divider()
     sku = st.session_state.get("uploaded_image_meta", {}).get("filename", "N/A")
-    st.markdown(f"**SKU Label:** `{sku}`")
+    st.markdown(f"**SKU Label (Filename):** `{sku}`")
 
 st.header("1. Upload Item Image")
 uploaded_file = st.file_uploader("Upload item photo", type=["jpg", "png"])
@@ -117,17 +120,23 @@ if uploaded_file:
 st.header("2. Run Appraisal")
 if st.button("Run Appraisal", disabled=not uploaded_file):
     with st.spinner("Gemini AI searching & classifying..."):
-        s3 = boto3.client("s3", region_name=_get_secret("AWS_REGION"), aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"), aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"))
+        # Image Hosting
+        s3 = boto3.client("s3", region_name=_get_secret("AWS_REGION"), 
+                          aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"), 
+                          aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"))
         key = f"uploads/{uuid.uuid4().hex}_{uploaded_file.name}"
         s3.put_object(Bucket=_get_secret("S3_BUCKET"), Key=key, Body=st.session_state["uploaded_image_bytes"])
         url = s3.generate_presigned_url('get_object', Params={'Bucket': _get_secret("S3_BUCKET"), 'Key': key}, ExpiresIn=3600)
         
-        lens = requests.get("https://serpapi.com/search.json", params={"engine": "google_lens", "url": url, "api_key": _get_secret("SERPAPI_API_KEY")}).json()
-        matches = [{"title": i.get("title"), "source": i.get("source"), "link": i.get("link"), "thumbnail": i.get("thumbnail")} for i in lens.get("visual_matches", [])[:15]]
+        # Search & Extraction
+        lens = requests.get("https://serpapi.com/search.json", 
+                            params={"engine": "google_lens", "url": url, "api_key": _get_secret("SERPAPI_API_KEY")}).json()
+        raw_matches = [{"title": i.get("title"), "source": i.get("source"), "link": i.get("link"), "thumbnail": i.get("thumbnail")} 
+                       for i in lens.get("visual_matches", [])[:15]]
         
         st.session_state["results"] = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "traceability": {"s3": {"presigned_url": url}, "search_summary": {"top_matches": upgrade_comps_with_gemini(matches)}}
+            "traceability": {"s3": {"presigned_url": url}, "search_summary": {"top_matches": upgrade_comps_with_gemini(raw_matches)}}
         }
 
 st.header("3. Results")
