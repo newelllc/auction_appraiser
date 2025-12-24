@@ -5,6 +5,7 @@ import time
 import hashlib
 import re
 from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import boto3
@@ -47,7 +48,7 @@ def apply_newel_branding():
   --gold:#EFDAAC;
 }
 
-/* Force light mode shell */
+/* Force light mode */
 html, body { background: var(--bg) !important; color: var(--text) !important; color-scheme: light !important; }
 .stApp { background: var(--bg) !important; color: var(--text) !important; font-family: 'EB Garamond', serif !important; }
 
@@ -93,7 +94,7 @@ h2 { font-size: 1.6rem !important; margin-top: 1.25rem !important; }
   border-radius: 12px !important;
 }
 
-/* ALL buttons: red w/ white text */
+/* ALL buttons: red w/ white text (includes Browse files + link_button) */
 button, .stButton>button {
   background-color: var(--btn) !important;
   color: #FFFFFF !important;
@@ -110,7 +111,7 @@ button:hover, .stButton>button:hover { background-color: var(--btnHover) !import
 .stTabs [data-baseweb="tab"]{ font-weight: 700 !important; letter-spacing: 0.08em !important; text-transform: uppercase !important; }
 .stTabs [data-baseweb="tab"][aria-selected="true"]{ color: var(--burgundy) !important; }
 
-/* Card + pills */
+/* Cards + pills */
 .result-card {
   background: var(--card) !important;
   border: 1px solid var(--border) !important;
@@ -167,36 +168,50 @@ def _container_border():
         return st.container()
 
 
+def _hostname(url: str) -> str:
+    try:
+        h = urlparse(url).netloc.lower()
+        if h.startswith("www."):
+            h = h[4:]
+        return h
+    except Exception:
+        return ""
+
+
 # ==========================================
-# 4. GEMINI FALLBACK + CACHING
+# 4. DOMAIN-BASED KIND (for Gemini OFF or failures)
+# ==========================================
+AUCTION_DOMAINS = {
+    "liveauctioneers.com",
+    "bidsquare.com",
+    "sothebys.com",
+    "christies.com",
+}
+RETAIL_DOMAINS = {
+    "1stdibs.com",
+    "chairish.com",
+    "incollect.com",
+    "rauantiques.com",
+}
+
+def _kind_from_domain(url: str) -> str:
+    host = _hostname(url)
+    if any(host.endswith(d) for d in AUCTION_DOMAINS):
+        return "auction"
+    if any(host.endswith(d) for d in RETAIL_DOMAINS):
+        return "retail"
+    return "other"
+
+
+# ==========================================
+# 5. GEMINI (optional) + fallback
 # ==========================================
 def _simple_kind_fallback(match: dict) -> dict:
-    title = (match.get("title") or "").lower()
-    source = (match.get("source") or "").lower()
-    link = (match.get("link") or "").lower()
-    text = f"{title} {source} {link}"
-
-    auction_signals = [
-        "liveauctioneers", "invaluable", "sothebys", "christies", "bonhams",
-        "heritage", "auction", "lot", "bids", "estimate", "hammer"
-    ]
-    retail_signals = [
-        "chairish", "1stdibs", "ebay", "etsy", "amazon", "walmart", "wayfair",
-        "buy now", "add to cart", "shop", "sale", "price"
-    ]
-
-    a = sum(1 for s in auction_signals if s in text)
-    r = sum(1 for s in retail_signals if s in text)
-
-    if a > r and a > 0:
-        match["kind"] = "auction"
-        match["confidence"] = 0.55
-    elif r > a and r > 0:
-        match["kind"] = "retail"
-        match["confidence"] = 0.55
-    else:
-        match["kind"] = "other"
-        match["confidence"] = 0.35
+    # Prefer domain mapping first
+    link = (match.get("link") or "").strip()
+    kind = _kind_from_domain(link)
+    match["kind"] = kind
+    match["confidence"] = 0.65 if kind in ("auction", "retail") else 0.35
 
     match.setdefault("auction_low", None)
     match.setdefault("auction_high", None)
@@ -223,7 +238,8 @@ def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
         for i, m in enumerate(matches):
             if i < len(cached):
                 m.update(cached[i])
-            m.setdefault("kind", "other")
+            # Ensure fields exist
+            m.setdefault("kind", _kind_from_domain(m.get("link") or ""))
             m.setdefault("confidence", None)
             m.setdefault("auction_low", None)
             m.setdefault("auction_high", None)
@@ -252,7 +268,7 @@ Return ONLY a JSON object with a key "results" containing the ordered list of ob
                 for i, m in enumerate(matches):
                     if i < len(ai_data):
                         m.update(ai_data[i])
-                    m.setdefault("kind", "other")
+                    m.setdefault("kind", _kind_from_domain(m.get("link") or ""))
                     m.setdefault("confidence", None)
                     m.setdefault("auction_low", None)
                     m.setdefault("auction_high", None)
@@ -270,106 +286,301 @@ Return ONLY a JSON object with a key "results" containing the ordered list of ob
         if not st.session_state["gemini_error_banner_shown"]:
             st.warning(
                 "Gemini classification is unavailable (quota/rate-limit). "
-                "Continuing with fallback classification so the appraisal can run."
+                "Continuing with domain-based classification + scraping."
             )
             st.session_state["gemini_error_banner_shown"] = True
+
         st.session_state["gemini_last_error"] = str(e)
         return [_simple_kind_fallback(m) for m in matches]
 
 
 # ==========================================
-# 5. SCRAPING: PRICE / ESTIMATE EXTRACTION
-#    - Best-effort; some sites render price via JS or block bots.
+# 6. SCRAPING: DOMAIN TARGETED PARSERS
 # ==========================================
-_MONEY_RE = re.compile(
+SCRIPT_JSONLD_RE = re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL
+)
+META_CONTENT_RE = re.compile(
+    r'<meta[^>]+(?:property|name)=["\']([^"\']+)["\'][^>]+content=["\']([^"\']+)["\']',
+    re.IGNORECASE
+)
+
+MONEY_RE = re.compile(
     r'(?:(?:USD|US\$)\s*)?\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)',
     re.IGNORECASE
 )
-_RANGE_RE = re.compile(
+RANGE_RE = re.compile(
     r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)\s*(?:-|–|to)\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)',
     re.IGNORECASE
 )
 
-def _to_number_string(x: str) -> str:
-    # Keep as string for Sheets/JSON; normalize commas
-    return x.replace(",", "").strip()
+def _clean_html_text(html: str) -> str:
+    text = re.sub(r"<script.*?>.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text[:250000]
 
-def _extract_best_retail_price(text: str) -> str | None:
-    """
-    Picks the first plausible retail price from HTML text.
-    Conservative: choose the smallest of the first few amounts (often list pages include many prices).
-    """
-    vals = []
-    for m in _MONEY_RE.finditer(text):
-        amt = _to_number_string(m.group(1))
-        try:
-            vals.append(Decimal(amt))
-        except InvalidOperation:
-            continue
-        if len(vals) >= 12:
-            break
-    if not vals:
+def _fetch_html(url: str) -> Optional[str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; NewelAppraiser/1.0; +https://newel.com)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=14, allow_redirects=True)
+        if r.status_code >= 400:
+            return None
+        return (r.text or "")[:600000]
+    except Exception:
         return None
-    # heuristic: choose median-ish of first values to avoid huge banner numbers
-    vals_sorted = sorted(vals)
-    mid = vals_sorted[len(vals_sorted)//2]
-    return f"${mid:,}".replace(",", ",")  # formatting keeps commas
 
-def _extract_estimate_range(text: str) -> tuple[str | None, str | None]:
+def _parse_jsonld_blocks(html: str) -> List[Any]:
+    blocks: List[Any] = []
+    for m in SCRIPT_JSONLD_RE.finditer(html):
+        raw = (m.group(1) or "").strip()
+        if not raw:
+            continue
+        # try to safely load JSON; if multiple objects or stray chars, best-effort cleanup
+        try:
+            obj = json.loads(raw)
+            blocks.append(obj)
+        except Exception:
+            # try to trim
+            trimmed = raw
+            # remove leading/trailing HTML comment markers if any
+            trimmed = trimmed.strip("<!--").strip("-->")
+            try:
+                obj = json.loads(trimmed)
+                blocks.append(obj)
+            except Exception:
+                continue
+    return blocks
+
+def _walk_find_prices(obj: Any) -> Dict[str, Any]:
     """
-    Look for explicit $X - $Y ranges near 'estimate' keywords.
+    Searches recursively for common schema.org product/offer fields.
+    Returns possible keys:
+      price, lowPrice, highPrice, priceCurrency, availability, reservePrice, estimateLow, estimateHigh
     """
-    # focus around "estimate" occurrences
+    found: Dict[str, Any] = {}
+
+    def rec(x: Any):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                lk = str(k).lower()
+                if lk in ("price", "lowprice", "highprice", "pricecurrency", "reserveprice", "reserve_price",
+                          "estimatelow", "estimatehigh", "lowestimate", "highestimate"):
+                    found[k] = v
+                if lk == "offers":
+                    # offers can be dict or list
+                    rec(v)
+                if lk == "@graph":
+                    rec(v)
+                rec(v)
+        elif isinstance(x, list):
+            for it in x:
+                rec(it)
+
+    rec(obj)
+    return found
+
+def _normalize_money(v: Any) -> Optional[str]:
+    """
+    Convert numeric-ish to formatted "$x,xxx.xx" or "$x,xxx".
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float, Decimal)):
+        d = Decimal(str(v))
+    else:
+        s = str(v).strip()
+        # pull first number
+        mm = re.search(r"([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)", s)
+        if not mm:
+            return None
+        try:
+            d = Decimal(mm.group(1).replace(",", ""))
+        except InvalidOperation:
+            return None
+    # format
+    if d == d.to_integral():
+        return f"${int(d):,}"
+    return f"${d:,.2f}"
+
+def _extract_meta_map(html: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for m in META_CONTENT_RE.finditer(html):
+        k = (m.group(1) or "").strip().lower()
+        v = (m.group(2) or "").strip()
+        if k and v:
+            out[k] = v
+    return out
+
+def _extract_retail_from_jsonld(html: str) -> Optional[str]:
+    blocks = _parse_jsonld_blocks(html)
+    for b in blocks:
+        found = _walk_find_prices(b)
+        # common: found["price"] or found["lowPrice"] etc.
+        if "price" in found:
+            p = _normalize_money(found["price"])
+            if p:
+                return p
+        # some use offers.lowPrice as sale
+        if "lowPrice" in found:
+            p = _normalize_money(found["lowPrice"])
+            if p:
+                return p
+    return None
+
+def _extract_auction_estimates_from_jsonld(html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    blocks = _parse_jsonld_blocks(html)
+    reserve = None
+    low = None
+    high = None
+    for b in blocks:
+        found = _walk_find_prices(b)
+        for k, v in found.items():
+            lk = str(k).lower()
+            if lk in ("lowestimate", "estimatelow", "lowprice"):
+                low = low or _normalize_money(v)
+            if lk in ("highestimate", "estimatehigh", "highprice"):
+                high = high or _normalize_money(v)
+            if lk in ("reserveprice", "reserve_price"):
+                reserve = reserve or _normalize_money(v)
+        if low and high and reserve:
+            break
+    return low, high, reserve
+
+def _extract_estimate_range_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
+    # Prefer windows near 'estimate'
     lowered = text.lower()
     idx = lowered.find("estimate")
     windows = []
     if idx != -1:
-        windows.append(text[max(0, idx-2000): idx+2000])
-    # fallback: entire doc window (smaller)
+        windows.append(text[max(0, idx - 3000): idx + 3000])
     windows.append(text[:120000])
-
     for w in windows:
-        rm = _RANGE_RE.search(w)
+        rm = RANGE_RE.search(w)
         if rm:
-            lo = "$" + rm.group(1)
-            hi = "$" + rm.group(2)
-            return lo, hi
+            return "$" + rm.group(1), "$" + rm.group(2)
     return None, None
 
-def _extract_reserve(text: str) -> str | None:
-    """
-    Reserve is rare; try to find 'reserve' near a $ amount.
-    """
+def _extract_reserve_from_text(text: str) -> Optional[str]:
     lowered = text.lower()
     if "reserve" not in lowered:
         return None
-    # find first reserve occurrence and search nearby for money
     pos = lowered.find("reserve")
-    window = text[max(0, pos-1500): pos+1500]
-    m = _MONEY_RE.search(window)
-    if m:
-        return "$" + m.group(1)
+    window = text[max(0, pos - 2000): pos + 2000]
+    mm = MONEY_RE.search(window)
+    if mm:
+        return "$" + mm.group(1)
     return None
 
-def _fetch_html(url: str) -> str | None:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; NewelAppraiser/1.0; +https://newel.com)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    try:
-        r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
-        if r.status_code >= 400:
-            return None
-        # Some sites return huge HTML; cap to keep performance stable
-        return (r.text or "")[:250000]
-    except Exception:
-        return None
+def _extract_retail_from_meta(html: str) -> Optional[str]:
+    meta = _extract_meta_map(html)
+    # common OpenGraph / product meta patterns
+    for k in (
+        "product:price:amount",
+        "og:price:amount",
+        "twitter:data1",
+        "twitter:label1",
+        "price",
+        "itemprop=price",
+    ):
+        if k in meta:
+            p = _normalize_money(meta[k])
+            if p:
+                return p
+    # also search for "price: $x" in meta content values
+    for v in meta.values():
+        if "$" in v:
+            p = _normalize_money(v)
+            if p:
+                return p
+    return None
 
-def enrich_matches_with_scraped_prices(matches: list[dict], max_to_scrape: int = 6) -> list[dict]:
+def _extract_retail_generic(text: str) -> Optional[str]:
+    # Grab first few money tokens; choose median to avoid outliers
+    vals: List[Decimal] = []
+    for m in MONEY_RE.finditer(text):
+        amt = m.group(1).replace(",", "").strip()
+        try:
+            vals.append(Decimal(amt))
+        except InvalidOperation:
+            continue
+        if len(vals) >= 10:
+            break
+    if not vals:
+        return None
+    vals.sort()
+    mid = vals[len(vals) // 2]
+    return _normalize_money(mid)
+
+def _domain_parser(url: str, html: str, kind: str) -> Dict[str, Any]:
+    host = _hostname(url)
+    text = _clean_html_text(html)
+
+    # ==========================
+    # RETAIL DOMAINS
+    # ==========================
+    if kind == "retail":
+        # Try JSON-LD first (best for 1stdibs, chairish, incollect, rauantiques)
+        rp = _extract_retail_from_jsonld(html)
+        if not rp:
+            rp = _extract_retail_from_meta(html)
+        if not rp:
+            rp = _extract_retail_generic(text)
+
+        out = {}
+        if rp:
+            out["retail_price"] = rp
+        return out
+
+    # ==========================
+    # AUCTION DOMAINS
+    # ==========================
+    if kind == "auction":
+        low, high, reserve = _extract_auction_estimates_from_jsonld(html)
+
+        # LiveAuctioneers sometimes embeds estimate fields in inline JSON
+        if (not low or not high) and host.endswith("liveauctioneers.com"):
+            # common patterns: "lowEstimate":1234, "highEstimate":5678, "estimate_low":...
+            mlo = re.search(r'"(?:lowEstimate|estimate_low|low_estimate)"\s*:\s*("?)([0-9,]+(?:\.[0-9]{2})?)\1', html, re.IGNORECASE)
+            mhi = re.search(r'"(?:highEstimate|estimate_high|high_estimate)"\s*:\s*("?)([0-9,]+(?:\.[0-9]{2})?)\1', html, re.IGNORECASE)
+            if mlo and not low:
+                low = _normalize_money(mlo.group(2))
+            if mhi and not high:
+                high = _normalize_money(mhi.group(2))
+
+        # Bidsquare sometimes includes estimate in page text; try range near estimate
+        if not low or not high:
+            rlo, rhi = _extract_estimate_range_from_text(text)
+            low = low or rlo
+            high = high or rhi
+
+        # Reserve rarely present publicly, but try:
+        if not reserve:
+            reserve = _extract_reserve_from_text(text)
+
+        out = {}
+        if low:
+            out["auction_low"] = low
+        if high:
+            out["auction_high"] = high
+        if reserve:
+            out["auction_reserve"] = reserve
+        return out
+
+    return {}
+
+
+def enrich_matches_with_scraped_prices(matches: list[dict], max_to_scrape: int = 8) -> list[dict]:
     """
-    Best-effort scrape to populate numeric fields when missing.
-    - Only scrapes the first N matches per run (performance guardrail)
-    - Caches per session by URL
+    Scrape listing pages and populate price/estimate fields.
+    - Only scrapes first N links per run (performance guardrail)
+    - Caches per URL in session
     """
     if "scrape_cache" not in st.session_state:
         st.session_state["scrape_cache"] = {}
@@ -383,17 +594,27 @@ def enrich_matches_with_scraped_prices(matches: list[dict], max_to_scrape: int =
         if not url:
             continue
 
-        # If already has required numbers, skip
-        if m.get("kind") == "auction":
-            if m.get("auction_low") is not None and m.get("auction_high") is not None and m.get("auction_reserve") is not None:
+        # Ensure kind is set
+        m.setdefault("kind", _kind_from_domain(url))
+        kind = m.get("kind")
+
+        # Only scrape target domains (as requested)
+        host = _hostname(url)
+        is_target = any(host.endswith(d) for d in (AUCTION_DOMAINS | RETAIL_DOMAINS))
+        if not is_target:
+            continue
+
+        # Skip if already has required fields
+        if kind == "auction":
+            if m.get("auction_low") and m.get("auction_high") and m.get("auction_reserve"):
                 continue
-        if m.get("kind") == "retail":
-            if m.get("retail_price") is not None:
+        if kind == "retail":
+            if m.get("retail_price"):
                 continue
 
         if url in st.session_state["scrape_cache"]:
-            cached = st.session_state["scrape_cache"][url]
-            m.update(cached)
+            m.update(st.session_state["scrape_cache"][url])
+            scraped += 1
             continue
 
         html = _fetch_html(url)
@@ -402,26 +623,15 @@ def enrich_matches_with_scraped_prices(matches: list[dict], max_to_scrape: int =
             scraped += 1
             continue
 
-        # Strip tags crudely for regex (cheap + effective)
-        text = re.sub(r"<script.*?>.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text)
+        update = _domain_parser(url, html, kind)
 
-        update = {}
-        if m.get("kind") == "retail":
-            rp = _extract_best_retail_price(text)
-            if rp:
-                update["retail_price"] = rp
-
-        elif m.get("kind") == "auction":
-            lo, hi = _extract_estimate_range(text)
-            if lo or hi:
-                update["auction_low"] = lo
-                update["auction_high"] = hi
-            resv = _extract_reserve(text)
-            if resv:
-                update["auction_reserve"] = resv
+        # Ensure keys exist even if not found (so UI always shows fields)
+        if kind == "auction":
+            update.setdefault("auction_low", m.get("auction_low"))
+            update.setdefault("auction_high", m.get("auction_high"))
+            update.setdefault("auction_reserve", m.get("auction_reserve"))
+        if kind == "retail":
+            update.setdefault("retail_price", m.get("retail_price"))
 
         st.session_state["scrape_cache"][url] = update
         m.update(update)
@@ -431,7 +641,7 @@ def enrich_matches_with_scraped_prices(matches: list[dict], max_to_scrape: int =
 
 
 # ==========================================
-# 6. GOOGLE SHEETS EXPORT (unchanged schema)
+# 7. GOOGLE SHEETS EXPORT (3 comps schema)
 # ==========================================
 def export_to_google_sheets(results: dict):
     sheet_id = _get_secret("GOOGLE_SHEET_ID")
@@ -474,7 +684,7 @@ def export_to_google_sheets(results: dict):
 
 
 # ==========================================
-# 7. UI RENDERER (native, clickable)
+# 8. UI RENDERER (native, clickable)
 # ==========================================
 def render_match_card_native(m: dict, kind_for_tab: str):
     thumb = m.get("thumbnail") or ""
@@ -525,15 +735,14 @@ def render_match_card_native(m: dict, kind_for_tab: str):
 
 
 # ==========================================
-# 8. SIDEBAR + MAIN UI
+# 9. SIDEBAR + MAIN UI
 # ==========================================
 with st.sidebar:
     st.markdown("<div class='newel-logo-text'>NEWEL</div>", unsafe_allow_html=True)
 
     st.toggle("Use Gemini classification", value=True, key="use_gemini")
-    # Scrape toggle: on by default so numbers show up when possible
-    st.toggle("Scrape prices from listing pages", value=True, key="use_scrape_prices")
-    st.slider("Max links to scrape per run", 0, 15, 6, key="max_scrape_links")
+    st.toggle("Scrape prices/estimates from listing pages", value=True, key="use_scrape_prices")
+    st.slider("Max listing links to scrape per run", 0, 20, 8, key="max_scrape_links")
 
     st.divider()
     sku = st.session_state.get("uploaded_image_meta", {}).get("filename", "N/A")
@@ -589,14 +798,11 @@ if st.button("Run Appraisal", disabled=not uploaded_file):
             for i in lens.get("visual_matches", [])[:15]
         ]
 
-        # Classify (Gemini if available; else fallback)
         top_matches = upgrade_comps_with_gemini(raw_matches)
 
-        # Scrape numbers (best-effort) so pricing fields populate without Gemini
         if st.session_state.get("use_scrape_prices", True):
             top_matches = enrich_matches_with_scraped_prices(
-                top_matches,
-                max_to_scrape=int(st.session_state.get("max_scrape_links", 6)),
+                top_matches, max_to_scrape=int(st.session_state.get("max_scrape_links", 8))
             )
 
         st.session_state["results"] = {
