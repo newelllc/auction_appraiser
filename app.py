@@ -8,103 +8,91 @@ import google.generativeai as genai
 from datetime import datetime
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
-import streamlit.components.v1 as components
 
 # ==========================================
-# 1. PAGE CONFIG & BRAND STYLES
+# 1. PAGE CONFIG & NEUTRAL BRANDING
 # ==========================================
 st.set_page_config(page_title="Newel Appraiser MVP", layout="wide")
 
 def apply_newel_branding():
-    # Force Light Mode and apply Typography/Color Palette [cite: 321, 332]
+    # Force EB Garamond and high-contrast palette
     st.markdown("""
         <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:wght@400;700&display=swap" rel="stylesheet">
         <style>
-        /* Base Theme Overrides */
+        /* 1. Global Reset - Force Light Mode and Dark Text */
         .stApp {
-            background-color: #FBF5EB !important; /* cite: 331 */
+            background-color: #FBF5EB !important;
+            font-family: 'EB Garamond', serif !important;
+        }
+        .stApp * {
+            color: #1C1C1E !important;
             font-family: 'EB Garamond', serif !important;
         }
 
-        /* Global Text Contrast Fix [cite: 332, 334] */
-        .stApp, .stApp p, .stApp span, .stApp label, .stApp div, .stApp li {
-            color: #1C1C1E !important; 
-            font-family: 'EB Garamond', serif !important;
-        }
-
-        /* Sidebar Styling [cite: 321, 338] */
+        /* 2. Sidebar - Mustard/Cream variant */
         [data-testid="stSidebar"] {
             background-color: #F8F2E8 !important;
             border-right: 1px solid #C2C2C2;
         }
-        [data-testid="stSidebar"] .newel-logo-text {
-            color: #8B0000 !important; /* cite: 323 */
-            font-size: 2.5rem;
+        .sidebar-title {
+            color: #8B0000 !important;
+            font-size: 2.2rem;
             font-weight: 700;
             text-align: center;
             letter-spacing: 0.1em;
+            margin-bottom: 0px;
         }
 
-        /* Header Styling [cite: 257] */
+        /* 3. Headers - Newel Red */
         h1, h2, h3, .brand-header {
-            font-family: 'EB Garamond', serif !important;
             color: #8B0000 !important;
             text-transform: uppercase;
             letter-spacing: 0.1em;
+            font-weight: 700 !important;
         }
 
-        /* Button Styling: Black with Cream Text [cite: 341, 361] */
+        /* 4. Buttons - Black with Cream Text (Primary CTA style) */
         div.stButton > button {
             background-color: #1C1C1E !important;
             color: #FBF5EB !important;
             border-radius: 0px !important;
             border: none !important;
-            padding: 0.75rem 2rem !important;
+            padding: 0.8rem 2rem !important;
             font-weight: 700;
             text-transform: uppercase;
             width: 100%;
         }
         div.stButton > button:hover {
-            background-color: #8B0000 !important; /* cite: 325 */
+            background-color: #8B0000 !important;
+            color: #FBF5EB !important;
         }
 
-        /* File Uploader Contrast Fix [cite: 337] */
+        /* 5. File Uploader - Remove Dark Overlays */
         [data-testid="stFileUploader"] { background-color: transparent !important; }
         [data-testid="stFileUploader"] section {
-            background-color: #F8F2E8 !important;
+            background-color: #FBF5EB !important;
             border: 1px dashed #C2C2C2 !important;
         }
 
-        /* Result Cards [cite: 132] */
+        /* 6. Result Cards - White with Grey Border */
         .result-card {
             background-color: white !important;
-            padding: 1.5rem;
+            padding: 20px;
             border: 1px solid #C2C2C2;
-            margin-bottom: 1rem;
-            border-radius: 2px;
+            margin-bottom: 15px;
+            border-radius: 0px;
         }
-        .result-title {
-            font-weight: 700;
-            font-size: 1.2rem;
-            color: #1C1C1E !important;
-        }
-
-        /* Financial Pills [cite: 136, 322] */
         .pill {
             background-color: #EFDAAC !important;
-            padding: 4px 12px;
+            padding: 5px 12px;
             border-radius: 20px;
-            font-size: 0.9rem;
             font-weight: 700;
             color: #1C1C1E !important;
             display: inline-block;
             margin: 5px 5px 0 0;
         }
-
-        /* Link Styling [cite: 324] */
         a {
             color: #8B0000 !important;
-            font-weight: 700;
             text-decoration: underline;
         }
         </style>
@@ -127,27 +115,20 @@ def _get_secret(name: str) -> str:
 def upgrade_comps_with_gemini(matches: list[dict]) -> list[dict]:
     genai.configure(api_key=_get_secret("GEMINI_API_KEY"))
     model = genai.GenerativeModel("gemini-2.0-flash")
-
-    # Limit payload to prevent quota issues [cite: 12]
     context = [{"title": m.get("title"), "source": m.get("source")} for m in matches]
-    prompt = f"""
-    Antique Expert: Classify matches into "auction" or "retail". 
-    Extract values for: kind, auction_low, auction_high, auction_reserve, retail_price.
-    Data: {json.dumps(context)}
-    Return JSON object with key "results".
-    """
+    prompt = f"Expert: Classify matches into 'auction' or 'retail'. Data: {json.dumps(context)}. Return JSON object with key 'results'."
     try:
         response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         ai_data = json.loads(response.text).get("results", [])
-        for i, match in enumerate(matches):
-            if i < len(ai_data): match.update(ai_data[i])
+        for i, m in enumerate(matches):
+            if i < len(ai_data): m.update(ai_data[i])
         return matches
     except Exception as e:
-        st.error(f"Gemini AI Error: {e}")
+        st.error(f"AI Error: {e}")
         return matches
 
 # ==========================================
-# 4. SERVICE: GOOGLE SHEETS EXPORT
+# 4. SERVICE: EXPORT
 # ==========================================
 def export_to_google_sheets(results: dict):
     sheet_id = _get_secret("GOOGLE_SHEET_ID")
@@ -156,11 +137,11 @@ def export_to_google_sheets(results: dict):
     img_url = trace.get("s3", {}).get("presigned_url", "")
     ts = results.get("timestamp")
 
-    auctions = [m for m in matches if m.get("kind") == "auction"][:3] # cite: 61
+    auctions = [m for m in matches if m.get("kind") == "auction"][:3]
     retails = [m for m in matches if m.get("kind") == "retail"][:3]
 
     def build_row(items, is_auc):
-        row = [ts, f'=IMAGE("{img_url}")', img_url] # cite: 124
+        row = [ts, f'=IMAGE("{img_url}")', img_url]
         for i in range(3):
             if i < len(items):
                 m = items[i]
@@ -183,13 +164,11 @@ def export_to_google_sheets(results: dict):
 # 5. UI COMPONENTS
 # ==========================================
 with st.sidebar:
-    st.markdown("<div class='newel-logo-text'>NEWEL</div>", unsafe_allow_html=True)
+    st.markdown("<div class='sidebar-title'>NEWEL</div>", unsafe_allow_html=True)
     st.divider()
     sku = st.session_state.get("uploaded_image_meta", {}).get("filename", "N/A")
-    st.markdown(f"**SKU Label:** `{sku}`") # cite: 130
-    
-    # Reset button [cite: 601]
-    if st.button("🔄 Start New Appraisal"):
+    st.markdown(f"**SKU Label:** `{sku}`")
+    if st.button("🔄 START NEW APPRAISAL"):
         for key in st.session_state.keys(): del st.session_state[key]
         st.rerun()
 
@@ -206,8 +185,8 @@ if uploaded_file:
 
 # 2. Run
 st.header("2. Run Appraisal")
-if st.button("Run Appraisal", disabled=not uploaded_file):
-    with st.spinner("Searching matches..."):
+if st.button("RUN APPRAISAL", disabled=not uploaded_file):
+    with st.spinner("Processing..."):
         s3 = boto3.client("s3", region_name=_get_secret("AWS_REGION"), 
                           aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"), 
                           aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"))
@@ -228,21 +207,21 @@ st.header("3. Results")
 res = st.session_state.get("results")
 if res:
     matches = res["traceability"]["search_summary"]["top_matches"]
-    t_auc, t_ret, t_misc = st.tabs(["Auction Results", "Retail Listings", "Other Matches"]) # cite: 131
+    t_auc, t_ret, t_misc = st.tabs(["Auction Results", "Retail Listings", "Other Matches"])
 
-    def render_cards(subset, show_prices):
+    def render_cards(subset, is_priced):
         if not subset:
-            st.info("No matches found in this category.")
+            st.info("No matches found.")
             return
         for m in subset:
-            auc_pill = f"<div class='pill'>Low: {m.get('auction_low')} | High: {m.get('auction_high')}</div>" if show_prices and m.get("auction_low") else ""
-            ret_pill = f"<div class='pill'>Retail: {m.get('retail_price')}</div>" if show_prices and m.get("retail_price") else ""
+            auc_pill = f"<div class='pill'>Low: {m.get('auction_low')} | High: {m.get('auction_high')}</div>" if is_priced and m.get("auction_low") else ""
+            ret_pill = f"<div class='pill'>Retail: {m.get('retail_price')}</div>" if is_priced and m.get("retail_price") else ""
             st.markdown(f"""
                 <div class="result-card">
                   <div style="display:flex; gap:16px;">
                     <img src="{m.get('thumbnail')}" width="110" style="object-fit:contain; border:1px solid #CFC7BC; background:#FFF;" />
                     <div>
-                      <div class="result-title">{m.get('title')}</div>
+                      <div style="font-weight:700; font-size:1.1rem;">{m.get('title')}</div>
                       <div>Source: {m.get('source')}</div>
                       {auc_pill} {ret_pill}
                       <div style="margin-top:10px;"><a href="{m.get('link')}" target="_blank">VIEW LISTING</a></div>
@@ -255,11 +234,11 @@ if res:
     with t_ret: render_cards([m for m in matches if m.get("kind") == "retail"], True)
     with t_misc: render_cards([m for m in matches if m.get("kind") not in ("auction", "retail")], False)
 
-    if st.button("🚀 Export to Google Sheets"):
-        with st.spinner("Appending rows..."):
+    if st.button("🚀 EXPORT TO GOOGLE SHEETS"):
+        with st.spinner("Exporting..."):
             try:
                 export_to_google_sheets(res)
-                st.toast("Success: Exported to Master Sheet") # cite: 43
+                st.toast("Success!")
                 st.markdown(f"[View Master Sheet]({_get_secret('GOOGLE_SHEET_URL')})")
             except Exception as e: st.error(f"Export failed: {e}")
 else:
