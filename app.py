@@ -1,385 +1,274 @@
 import os
 import uuid
-from datetime import datetime
-from urllib.parse import urlparse
-
+import json
 import boto3
 import requests
 import streamlit as st
-import base64
-
-# 1. Use a URL if the logo is hosted, OR 
-# 2. Use this robust local check to prevent the app from crashing
-def add_logo():
-    logo_path = "logo.png"
-    try:
-        st.sidebar.image(logo_path, use_container_width=True)
-    except Exception:
-        # Fallback to a text-based brand header if the file is missing
-        st.sidebar.markdown("## NEWEL")
-        st.sidebar.markdown("*EST 1939*")
-        st.sidebar.warning("Note: 'logo.png' not found in root. App continuing with text branding.")
-
-add_logo()
-
+from datetime import datetime
+from openai import OpenAI
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 
-# =========================
-# Page Config
-# =========================
-st.set_page_config(page_title="Newel Appraiser MVP", layout="centered")
-st.title("Newel Appraiser")
-st.caption("Internal MVP • Image-based appraisal")
+# ==========================================
+# 1. PAGE CONFIG & NEWEL BRANDING [cite: 172, 339]
+# ==========================================
+st.set_page_config(page_title="Newel Appraiser MVP", layout="wide")
 
-# =========================
-# Secrets helper
-# =========================
-def _get_secret(name: str, default: str | None = None) -> str:
-    if name in st.secrets:
-        return str(st.secrets[name])
-    val = os.getenv(name, default)
-    if val is None:
-        raise RuntimeError(f"Missing required secret/env var: {name}")
-    return str(val)
+def apply_newel_branding():
+    """Injects Newel Brand Guide styles[cite: 319, 320, 332]."""
+    st.markdown(f"""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@700&family=EB+Garamond:wght@400;500&display=swap');
 
-# =========================
-# S3 helpers
-# =========================
-def _s3_client():
-    return boto3.client(
-        "s3",
-        region_name=_get_secret("AWS_REGION"),
-        aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"),
-    )
+        .stApp {{
+            background-color: #F8F2E8 !important; /* Brand Light Neutral [cite: 321] */
+            color: #1C1C1E !important; /* Primary Text [cite: 332] */
+            font-family: 'EB Garamond', serif;
+        }}
 
-def upload_bytes_to_s3_and_presign(*, file_bytes: bytes, content_type: str, original_filename: str) -> dict:
-    bucket = _get_secret("S3_BUCKET")
-    prefix = _get_secret("S3_PREFIX", "").strip("/")
-    ttl = int(_get_secret("PRESIGNED_URL_TTL_SECONDS", "3600"))
+        h1, h2, h3, .brand-header {{
+            font-family: 'Cormorant Garamond', serif !important;
+            color: #8B0000 !important; /* Newel Red [cite: 199] */
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }}
 
-    ext = ""
-    if "." in (original_filename or ""):
-        ext = "." + original_filename.split(".")[-1].lower()
+        /* Sidebar Styling [cite: 333, 338] */
+        [data-testid="stSidebar"] {{
+            background-color: #FBF5EB !important;
+            border-right: 1px solid #C2C2C2;
+        }}
 
-    key = f"{uuid.uuid4().hex}{ext}"
-    if prefix:
-        key = f"{prefix}/{key}"
-
-    client = _s3_client()
-    client.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=file_bytes,
-        ContentType=content_type or "application/octet-stream",
-        Metadata={
-            "original_filename": (original_filename or "")[:200],
-            "uploaded_utc": datetime.utcnow().isoformat(),
-        },
-    )
-
-    url = client.generate_presigned_url(
-        ClientMethod="get_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=ttl,
-    )
-
-    return {"bucket": bucket, "key": key, "presigned_url": url, "ttl_seconds": ttl}
-
-# =========================
-# SerpApi (Google Lens)
-# =========================
-def serpapi_google_lens_search(image_url: str) -> dict:
-    api_key = _get_secret("SERPAPI_API_KEY")
-    params = {"engine": "google_lens", "url": image_url, "api_key": api_key}
-    resp = requests.get("https://serpapi.com/search.json", params=params, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
-
-# =========================
-# Match extraction helpers
-# =========================
-def extract_top_lens_matches(lens_json: dict, limit: int = 5) -> list[dict]:
-    matches: list[dict] = []
-    visual_matches = (lens_json or {}).get("visual_matches", [])
-    
-    for item in visual_matches[:limit]:
-        price = item.get("price")
-        if isinstance(price, dict):
-            price_value = price.get("extracted_value", price.get("value", ""))
-            currency = price.get("currency", "")
-        else:
-            price_value = price or ""
-            currency = ""
-
-        matches.append({
-            "title": item.get("title") or "Unknown Title",
-            "source": item.get("source") or item.get("domain") or "Unknown Source",
-            "link": item.get("link") or "",
-            "thumbnail": item.get("thumbnail") or "",
-            "price": price_value,
-            "currency": currency,
-        })
-
-    if not matches:
-        for item in (lens_json or {}).get("shopping_results", [])[:limit]:
-            matches.append({
-                "title": item.get("title") or "Unknown Title",
-                "source": item.get("source") or item.get("seller") or "Unknown Seller",
-                "link": item.get("link") or "",
-                "thumbnail": item.get("thumbnail") or "",
-                "price": item.get("price") or "",
-                "currency": item.get("currency") or "",
-            })
-    return matches
-
-def csv_safe(text: str) -> str:
-    return (str(text) or "").replace('"', '""').replace("\n", " ").replace("\r", " ").strip()
-
-def summarize_matches_for_csv(top_matches: list[dict]) -> dict:
-    titles, sources, links, prices = [], [], [], []
-    for m in top_matches or []:
-        titles.append(csv_safe(m.get("title", "")))
-        sources.append(csv_safe(m.get("source", "")))
-        links.append(csv_safe(m.get("link", "")))
-        price = m.get("price", "")
-        currency = m.get("currency", "")
-        price_str = f"{currency} {price}".strip() if (currency or price) else ""
-        prices.append(csv_safe(price_str))
-    return {
-        "top_match_titles": " | ".join(titles),
-        "top_match_sources": " | ".join(sources),
-        "top_match_links": " | ".join(links),
-        "top_match_prices": " | ".join(prices),
-        "top_match_count": str(len(top_matches or [])),
-    }
-
-# =========================
-# Google Sheets export
-# =========================
-def _google_creds():
-    if "google_service_account" not in st.secrets:
-        raise RuntimeError("Missing [google_service_account] in Streamlit secrets.")
-
-    sa_raw = st.secrets["google_service_account"]
-    sa_info = {k: ("" if sa_raw[k] is None else str(sa_raw[k])) for k in sa_raw.keys()}
-
-    pk = sa_info.get("private_key", "")
-    if "\\n" in pk:
-        pk = pk.replace("\\n", "\n")
-    sa_info["private_key"] = pk
-
-    creds = service_account.Credentials.from_service_account_info(
-        sa_info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
-    return creds
-
-def append_row_to_sheet(*, sheet_id: str, tab_name: str, row_values: list):
-    creds = _google_creds()
-    creds.refresh(Request())
-    token = creds.token
-
-    safe_values = ["" if v is None else str(v) for v in row_values]
-
-    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab_name}!A:Z:append"
-    params = {"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"}
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    body = {"values": [safe_values]}
-
-    resp = requests.post(url, params=params, headers=headers, json=body, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
-
-def export_to_google_sheets(results: dict):
-    sheet_id = _get_secret("GOOGLE_SHEET_ID")
-    trace = results.get("traceability", {})
-    s3 = trace.get("s3", {})
-    img_url = s3.get("presigned_url", "")
-    thumb_formula = f'=IMAGE("{img_url}")' if img_url else ""
-
-    matches = trace.get("search_summary", {}).get("top_matches", [])
-
-    auction = [m for m in matches if "auction" in (m.get("source", "").lower())]
-    retail = [m for m in matches if "auction" not in (m.get("source", "").lower())]
-
-    def summarize(items):
-        titles = " | ".join([m.get("title", "") for m in items])
-        links = " | ".join([m.get("link", "") for m in items])
-        prices = " | ".join([f"{m.get('currency','')} {m.get('price','')}".strip() for m in items])
-        return titles, links, prices
-
-    ts = results.get("timestamp", datetime.utcnow().isoformat())
-    a_titles, a_links, a_prices = summarize(auction)
-    r_titles, r_links, r_prices = summarize(retail)
-
-    append_row_to_sheet(sheet_id=sheet_id, tab_name="Auction",
-                        row_values=[ts, thumb_formula, img_url, a_titles, a_links, a_prices])
-    append_row_to_sheet(sheet_id=sheet_id, tab_name="Retail",
-                        row_values=[ts, thumb_formula, img_url, r_titles, r_links, r_prices])
-
-# =========================
-# UI Rendering Helper
-# =========================
-def render_results_ui(results: dict):
-    if not results:
-        return
+        /* Button Styling [cite: 341, 365] */
+        div.stButton > button {{
+            background-color: #1C1C1E !important;
+            color: white !important;
+            border-radius: 0px !important;
+            border: none !important;
+            font-family: 'Cormorant Garamond', serif !important;
+            padding: 0.5rem 2rem !important;
+        }}
         
-    if results.get("status") == "error":
-        st.error(results.get("message"))
-        return
+        div.stButton > button:hover {{
+            background-color: #8B0000 !important;
+        }}
 
-    st.success("Appraisal Complete!")
+        /* Financial Pills [cite: 136, 147] */
+        .pill {{
+            background-color: #EFDAAC; /* Accent [cite: 322] */
+            padding: 4px 10px;
+            border-radius: 15px;
+            font-size: 0.85rem;
+            font-weight: bold;
+            color: #1C1C1E;
+            margin-right: 5px;
+            display: inline-block;
+        }}
+
+        .result-card {{
+            background-color: white;
+            padding: 1.5rem;
+            border: 1px solid #C2C2C2;
+            margin-bottom: 1rem;
+            border-radius: 2px;
+        }}
+        </style>
+    """, unsafe_allow_html=True)
+
+apply_newel_branding()
+
+# ==========================================
+# 2. CORE UTILITIES & SECRETS [cite: 105, 452]
+# ==========================================
+def _get_secret(name: str) -> str:
+    if name in st.secrets: return str(st.secrets[name])
+    val = os.getenv(name)
+    if not val: raise RuntimeError(f"Missing required secret: {name}")
+    return val
+
+# ==========================================
+# 3. SERVICE: CLASSIFICATION & EXTRACTION [cite: 10, 15, 140]
+# ==========================================
+def upgrade_comps_with_openai(matches: list[dict]) -> list[dict]:
+    """Uses OpenAI to classify and extract prices WITHOUT scraping[cite: 20, 152]."""
+    client = OpenAI(api_key=_get_secret("OPENAI_API_KEY"))
     
-    matches = results.get("traceability", {}).get("search_summary", {}).get("top_matches", [])
+    context = [{"title": m["title"], "source": m["source"], "link": m["link"]} for m in matches]
+
+    prompt = f"""
+    You are an antique furniture appraisal expert. Classify matches into "auction" or "retail".
+    Extract specific financial fields found in titles or snippets.
     
-    if not matches:
-        st.warning("No visual matches found by Google Lens.")
-        return
+    Input Data: {json.dumps(context)}
 
-    st.subheader("Visual Matches Found")
-    for idx, item in enumerate(matches):
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            if item.get("thumbnail"):
-                st.image(item["thumbnail"])
-        with col2:
-            st.markdown(f"**{item.get('title')}**")
-            st.write(f"Source: {item.get('source')}")
-            price_str = f"{item.get('currency')} {item.get('price')}".strip()
-            if price_str:
-                st.write(f"Price: {price_str}")
-            st.markdown(f"[View Link]({item.get('link')})")
-        st.divider()
+    Return a JSON object with a key "results" containing objects with:
+    - kind: "auction" (past sales) or "retail" (active asking price)
+    - confidence: 0.0 to 1.0
+    - auction_low: number or null
+    - auction_high: number or null
+    - auction_reserve: number or null
+    - retail_price: number or null
+    - normalized_source: e.g., "1stdibs", "liveauctioneers", "chairish"
+    """
 
-    if st.button("🚀 Export Results to Google Sheets"):
-        with st.spinner("Exporting..."):
-            try:
-                export_to_google_sheets(results)
-                st.toast("Successfully exported to Sheets!")
-            except Exception as e:
-                st.error(f"Export failed: {e}")
-
-# =========================
-# Session State Init
-# =========================
-if "image_uploaded" not in st.session_state:
-    st.session_state["image_uploaded"] = False
-if "uploaded_image_bytes" not in st.session_state:
-    st.session_state["uploaded_image_bytes"] = None
-if "uploaded_image_meta" not in st.session_state:
-    st.session_state["uploaded_image_meta"] = None
-if "results" not in st.session_state:
-    st.session_state["results"] = None
-
-# =========================
-# 1) Upload
-# =========================
-st.header("1. Upload Item Image")
-
-uploaded_file = st.file_uploader(
-    "Upload a clear photo of the item",
-    type=["jpg", "jpeg", "png"],
-    key="item_image_uploader",
-)
-
-if uploaded_file is not None:
-    st.session_state["image_uploaded"] = True
-    st.session_state["uploaded_image_bytes"] = uploaded_file.getvalue()
-    st.session_state["uploaded_image_meta"] = {
-        "filename": uploaded_file.name,
-        "content_type": uploaded_file.type,
-        "size_bytes": len(st.session_state["uploaded_image_bytes"]),
-    }
-    st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
-
-# =========================
-# 2) Run Appraisal
-# =========================
-st.header("2. Run Appraisal")
-
-is_uploaded = st.session_state.get("image_uploaded", False)
-run_disabled = not is_uploaded
-
-if st.button("Run Appraisal", disabled=run_disabled, key="run_appraisal_btn"):
-    with st.spinner("Processing image and searching..."):
-        try:
-            img_bytes = st.session_state.get("uploaded_image_bytes")
-            img_meta = st.session_state.get("uploaded_image_meta", {})
-            
-            s3_info = upload_bytes_to_s3_and_presign(
-                file_bytes=img_bytes,
-                content_type=img_meta.get("content_type", ""),
-                original_filename=img_meta.get("filename", "upload"),
-            )
-
-            lens = serpapi_google_lens_search(s3_info["presigned_url"])
-            top_matches = extract_top_lens_matches(lens, limit=5)
-            csv_summary = summarize_matches_for_csv(top_matches)
-
-            st.session_state["results"] = {
-                "status": "lens_ok",
-                "message": "Image processed successfully.",
-                "timestamp": datetime.utcnow().isoformat(),
-                "traceability": {
-                    "image": img_meta,
-                    "s3": s3_info,
-                    "search": {"provider": "serpapi", "engine": "google_lens", "raw": lens},
-                    "search_summary": {"top_matches": top_matches},
-                },
-                "csv_summary": csv_summary,
-            }
-        except Exception as e:
-            st.session_state["results"] = {
-                "status": "error",
-                "message": f"Appraisal failed: {type(e).__name__}: {e}",
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-
-# =========================
-# 3) Results
-# =========================
-st.header("3. Results")
-
-current_results = st.session_state.get("results")
-
-if current_results:
-    render_results_ui(current_results)
-
-    with st.expander("JSON Output"):
-        st.json(current_results, expanded=False)
-
-    with st.expander("CSV Output (Single Row)"):
-        r = current_results
-        # FIXED: Corrected parenthesis on the line below
-        presigned_url = r.get("traceability", {}).get("s3", {}).get("presigned_url", "")
-        cs = r.get("csv_summary", {})
-        
-        csv_header = "status,message,timestamp,presigned_url,top_match_count,top_match_titles,top_match_sources,top_match_links,top_match_prices"
-        csv_values = [
-            r.get('status', ''),
-            r.get('message', ''),
-            r.get('timestamp', ''),
-            presigned_url,
-            cs.get('top_match_count', ''),
-            cs.get('top_match_titles', ''),
-            cs.get('top_match_sources', ''),
-            cs.get('top_match_links', ''),
-            cs.get('top_match_prices', '')
-        ]
-        csv_row = ",".join([f'"{csv_safe(v)}"' for v in csv_values])
-        csv_data = f"{csv_header}\n{csv_row}\n"
-        
-        st.download_button(
-            label="Download CSV",
-            data=csv_data,
-            file_name="appraisal_result.csv",
-            mime="text/csv",
-            key="download_csv_btn",
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
         )
-else:
-    st.info("No appraisal run yet.")
+        ai_data = json.loads(response.choices[0].message.content).get("results", [])
+        for i, match in enumerate(matches):
+            if i < len(ai_data): match.update(ai_data[i])
+        return matches
+    except Exception as e:
+        st.error(f"AI Extraction Error: {e}")
+        return matches
 
-st.divider()
-st.caption("Traceability: image → S3 presigned URL → Google Lens → export")
+# ==========================================
+# 4. SERVICE: GOOGLE SHEETS EXPORT [cite: 22, 94, 153]
+# ==========================================
+def export_to_google_sheets(results: dict):
+    """Appends to Sheet with explicit columns for first 3 comps[cite: 28, 61, 154]."""
+    sheet_id = _get_secret("GOOGLE_SHEET_ID")
+    trace = results["traceability"]
+    matches = trace["search_summary"]["top_matches"]
+    img_url = trace["s3"]["presigned_url"]
+    ts = results["timestamp"]
+    
+    # Filter by AI-defined kind [cite: 13]
+    auctions = [m for m in matches if m.get("kind") == "auction"][:3]
+    retails = [m for m in matches if m.get("kind") == "retail"][:3]
+
+    def build_row(kind_list, is_auction=True):
+        row = [ts, f'=IMAGE("{img_url}")', img_url]
+        for i in range(3):
+            if i < len(kind_list):
+                m = kind_list[i]
+                row.extend([m.get("title"), m.get("link")])
+                if is_auction:
+                    row.extend([m.get("auction_low"), m.get("auction_high"), m.get("auction_reserve")])
+                else:
+                    row.append(m.get("retail_price"))
+            else:
+                row.extend([""] * (5 if is_auction else 3))
+        return row
+
+    # Service Account Auth [cite: 97, 106]
+    sa_info = st.secrets["google_service_account"]
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    creds.refresh(Request())
+    
+    for tab, items, is_auc in [("Auction", auctions, True), ("Retail", retails, False)]:
+        row_data = build_row(items, is_auction=is_auc)
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab}!A:Z:append"
+        requests.post(url, params={"valueInputOption": "USER_ENTERED"}, 
+                      headers={"Authorization": f"Bearer {creds.token}"}, 
+                      json={"values": [row_data]}, timeout=30)
+
+# ==========================================
+# 5. UI COMPONENTS [cite: 126, 459]
+# ==========================================
+with st.sidebar:
+    st.markdown("<h2 class='brand-header'>Newel Appraiser</h2>", unsafe_allow_html=True)
+    logo_path = "logo.png"
+    if os.path.exists(logo_path):
+        st.image(logo_path, use_container_width=True)
+    else:
+        st.caption("EST 1939") # [cite: 200]
+    
+    st.divider()
+    sku = st.session_state.get("uploaded_image_meta", {}).get("filename", "N/A")
+    st.markdown(f"**SKU Label (Filename):**\n`{sku}`") # [cite: 4]
+
+st.header("1. Upload Item Image")
+uploaded_file = st.file_uploader("Drop image here [cite: 411]", type=["jpg", "png"])
+
+if uploaded_file:
+    st.session_state["uploaded_image_bytes"] = uploaded_file.getvalue()
+    st.session_state["uploaded_image_meta"] = {"filename": uploaded_file.name, "content_type": uploaded_file.type}
+    st.image(uploaded_file, width=400)
+
+st.header("2. Run Appraisal")
+if st.button("Run Appraisal", disabled=not uploaded_file):
+    with st.spinner("Searching & Classifying..."):
+        # Image Hosting (S3) [cite: 87, 435]
+        s3_client = boto3.client("s3", region_name=_get_secret("AWS_REGION"),
+                                 aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"),
+                                 aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"))
+        key = f"uploads/{uuid.uuid4().hex}_{uploaded_file.name}"
+        s3_client.put_object(Bucket=_get_secret("S3_BUCKET"), Key=key, Body=st.session_state["uploaded_image_bytes"])
+        presigned = s3_client.generate_presigned_url('get_object', Params={'Bucket': _get_secret("S3_BUCKET"), 'Key': key}, ExpiresIn=3600)
+        
+        # SerpApi Search [cite: 90, 412]
+        params = {"engine": "google_lens", "url": presigned, "api_key": _get_secret("SERPAPI_API_KEY")}
+        lens_raw = requests.get("https://serpapi.com/search.json", params=params).json()
+        
+        # Extraction & AI Upgrade [cite: 11, 140]
+        raw_matches = []
+        for item in lens_raw.get("visual_matches", [])[:20]:
+            raw_matches.append({
+                "title": item.get("title"), "source": item.get("source"), 
+                "link": item.get("link"), "thumbnail": item.get("thumbnail")
+            })
+        
+        upgraded_matches = upgrade_comps_with_openai(raw_matches)
+        
+        st.session_state["results"] = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "traceability": {
+                "s3": {"presigned_url": presigned},
+                "search_summary": {"top_matches": upgraded_matches},
+                "raw_serpapi": lens_raw
+            }
+        }
+
+st.header("3. Results [cite: 127]")
+res = st.session_state.get("results")
+if res:
+    matches = res["traceability"]["search_summary"]["top_matches"]
+    
+    # Filters [cite: 5, 158]
+    c1, c2 = st.columns(2)
+    with c1:
+        priced_only = st.toggle("Show only priced results [cite: 7, 160]", value=False)
+    with c2:
+        limit = st.select_slider("Results count [cite: 8, 161]", options=[10, 25, 50], value=10)
+
+    # Tabs [cite: 131]
+    t_auc, t_ret = st.tabs(["🔨 Auction", "🛋️ Retail"])
+    
+    for tab, kind in [(t_auc, "auction"), (t_ret, "retail")]:
+        with tab:
+            subset = [m for m in matches if m.get("kind") == kind]
+            if priced_only:
+                subset = [m for m in subset if m.get("auction_low") or m.get("retail_price")]
+            
+            for m in subset[:limit]:
+                st.markdown(f"""
+                <div class="result-card">
+                    <div style="display: flex; gap: 15px;">
+                        <img src="{m['thumbnail']}" width="80">
+                        <div>
+                            <b>{m['title']}</b><br>
+                            <small>{m['source']}</small><br>
+                            <div style="margin-top:5px;">
+                                {"<span class='pill'>Low: " + str(m['auction_low']) + "</span>" if m.get('auction_low') else ""}
+                                {"<span class='pill'>Price: " + str(m['retail_price']) + "</span>" if m.get('retail_price') else ""}
+                            </div>
+                            <a href="{m['link']}" target="_blank">View Listing</a>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+    if st.button("🚀 Export to Google Sheets [cite: 129]"):
+        with st.spinner("Writing columns..."):
+            export_to_google_sheets(res)
+            st.toast("Success: Sheet Updated! [cite: 43]")
+            st.markdown(f"[Click here to view Sheet]({_get_secret('GOOGLE_SHEET_URL')}) [cite: 44]")
+
+    with st.expander("Internal Traceability [cite: 47, 164]"):
+        st.json(res)
