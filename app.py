@@ -1,3 +1,4 @@
+# (Full file — updated sanitization to strip tags before escaping)
 import os
 import uuid
 import json
@@ -819,10 +820,16 @@ def export_to_google_sheets(results: dict):
 # ==========================================
 # 13) UI RENDERER (HTML-escaped values: stops CSS injection)
 # ==========================================
+def _strip_tags(v: Any) -> str:
+    """Remove any HTML tags from a value and return a plain string."""
+    if v is None:
+        return ""
+    return re.sub(r"<[^>]+>", "", str(v))
+
 def _pill(label: str, value: Any) -> str:
-    # Use double quotes and a clean span so concatenated pills render correctly
+    # Strip any tags from the value, then HTML-escape — prevents tag fragments from leaking
     safe_label = html_escape(label)
-    safe_value = html_escape(str(value) if value is not None else "—")
+    safe_value = html_escape(_strip_tags(value) or "—")
     return f"<span class=\"pill\">{safe_label}: {safe_value}</span>"
 
 def render_match_card_native(m: dict, kind_for_view: str):
@@ -848,10 +855,11 @@ def render_match_card_native(m: dict, kind_for_view: str):
 
             if kind_for_view == "auction":
                 # build pill list and join with a space so the span boundary isn't interpreted as visible text
+                # also ensure we use stripped values when creating pills
                 pill_list = [
-                    _pill("Low Estimate", m.get("auction_low") or "—"),
-                    _pill("High Estimate", m.get("auction_high") or "—"),
-                    _pill("Auction Reserve", m.get("auction_reserve") or "—"),
+                    _pill("Low Estimate", _strip_tags(m.get("auction_low")) or "—"),
+                    _pill("High Estimate", _strip_tags(m.get("auction_high")) or "—"),
+                    _pill("Auction Reserve", _strip_tags(m.get("auction_reserve")) or "—"),
                 ]
                 pills_html = " ".join(pill_list)
                 # render inside an isolated HTML iframe to avoid Streamlit markdown mangling
@@ -862,7 +870,7 @@ def render_match_card_native(m: dict, kind_for_view: str):
                 )
             elif kind_for_view == "retail":
                 # single pill is safe to render via markdown with unsafe HTML
-                st.markdown(_pill("Retail Price", m.get("retail_price") or "—"), unsafe_allow_html=True)
+                st.markdown(_pill("Retail Price", _strip_tags(m.get("retail_price")) or "—"), unsafe_allow_html=True)
             else:
                 conf = m.get("confidence")
                 if conf is not None:
@@ -890,12 +898,13 @@ def _content_context_for_mode(results: dict, mode: str) -> str:
         source = (m.get("source") or "").strip()
         link = (m.get("link") or "").strip()
         if mode == "auction":
-            low = m.get("auction_low") or "—"
-            high = m.get("auction_high") or "—"
-            reserve = m.get("auction_reserve") or "—"
+            # ensure values inserted into the AI prompt are stripped of tags
+            low = _strip_tags(m.get("auction_low")) or "—"
+            high = _strip_tags(m.get("auction_high")) or "—"
+            reserve = _strip_tags(m.get("auction_reserve")) or "—"
             lines.append(f"{i}. {title} | {source} | low={low}, high={high}, reserve={reserve} | {link}")
         else:
-            rp = m.get("retail_price") or "—"
+            rp = _strip_tags(m.get("retail_price")) or "—"
             lines.append(f"{i}. {title} | {source} | retail_price={rp} | {link}")
 
     sku = results.get("traceability", {}).get("sku_label", "")
