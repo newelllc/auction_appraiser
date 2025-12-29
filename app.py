@@ -820,9 +820,10 @@ def export_to_google_sheets(results: dict):
 # 13) UI RENDERER (HTML-escaped values: stops CSS injection)
 # ==========================================
 def _pill(label: str, value: Any) -> str:
+    # Use double quotes and a clean span so concatenated pills render correctly
     safe_label = html_escape(label)
     safe_value = html_escape(str(value) if value is not None else "—")
-    return f"<span class='pill'>{safe_label}: {safe_value}</span>"
+    return f"<span class=\"pill\">{safe_label}: {safe_value}</span>"
 
 def render_match_card_native(m: dict, kind_for_view: str):
     thumb = m.get("thumbnail") or ""
@@ -845,12 +846,14 @@ def render_match_card_native(m: dict, kind_for_view: str):
             st.markdown(f"<span class='meta'>Source: {html_escape(source)}</span>", unsafe_allow_html=True)
 
             if kind_for_view == "auction":
-                pills = (
-                    _pill("Low Estimate", m.get("auction_low") or "—")
-                    + _pill("High Estimate", m.get("auction_high") or "—")
-                    + _pill("Auction Reserve", m.get("auction_reserve") or "—")
-                )
-                st.markdown(pills, unsafe_allow_html=True)
+                # build pill list and join with a space so the span boundary isn't interpreted as visible text
+                pill_list = [
+                    _pill("Low Estimate", m.get("auction_low") or "—"),
+                    _pill("High Estimate", m.get("auction_high") or "—"),
+                    _pill("Auction Reserve", m.get("auction_reserve") or "—"),
+                ]
+                pills_html = " ".join(pill_list)
+                st.markdown(pills_html, unsafe_allow_html=True)
             elif kind_for_view == "retail":
                 st.markdown(_pill("Retail Price", m.get("retail_price") or "—"), unsafe_allow_html=True)
             else:
@@ -891,12 +894,12 @@ def _content_context_for_mode(results: dict, mode: str) -> str:
     sku = results.get("traceability", {}).get("sku_label", "")
     img_url = results.get("traceability", {}).get("s3", {}).get("presigned_url", "")
 
-    return f"""SKU: {sku}
+    return f\"\"\"SKU: {sku}
 Image URL: {img_url}
 Mode: {mode}
 Reference Listings:
 {chr(10).join(lines)}
-""".strip()
+\"\"\".strip()
 
 def generate_auction_title(results: dict) -> str:
     ctx = _content_context_for_mode(results, "auction")
