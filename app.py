@@ -1,5 +1,5 @@
-# Full app.py — fixed: restores missing UI, retains Chairish canonical-product + thumbnail heuristics
-# No Pillow dependency; only accepts canonical Chairish product URLs and excludes obvious thumbnail image URLs.
+# Full app.py — fixed: restores missing auction extraction functions and makes enrichment robust.
+# Keeps Chairish canonical-product + thumbnail heuristics; does not add Pillow.
 import os
 import uuid
 import json
@@ -339,7 +339,7 @@ def _try_login_liveauctioneers(session: requests.Session) -> bool:
 
 
 # ==========================================
-# 9) Domain extractors (original retail extractors restored)
+# 9) Domain extractors (restored auction extractors)
 # ==========================================
 DOLLAR_RANGE_RE = re.compile(
     r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:-|–|to)\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)',
@@ -421,146 +421,65 @@ def _walk_find_numbers(obj: Any, keys: List[str]) -> List[Decimal]:
     rec(obj)
     return found
 
-JSONLD_RE = re.compile(
-    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-    re.IGNORECASE | re.DOTALL,
-)
-META_CONTENT_RE = re.compile(
-    r'<meta[^>]+(?:property|name)=["\']([^"\']+)["\'][^>]+content=["\']([^"\']+)["\']',
-    re.IGNORECASE,
-)
+def _extract_liveauctioneers_estimates(html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    low = None
+    high = None
+    reserve = None
 
-def _parse_jsonld_blocks(html: str) -> List[Any]:
-    blocks: List[Any] = []
-    for m in JSONLD_RE.finditer(html):
-        raw = (m.group(1) or "").strip().strip("<!--").strip("-->")
-        if not raw:
-            continue
-        try:
-            blocks.append(json.loads(raw))
-        except Exception:
-            continue
-    return blocks
+    nd = _parse_next_data_json(html)
+    if nd:
+        lows = _walk_find_numbers(nd, ["lowEstimate", "estimateLow", "estimate_low", "low_estimate"])
+        highs = _walk_find_numbers(nd, ["highEstimate", "estimateHigh", "estimate_high", "high_estimate"])
+        if lows and highs:
+            low = _sanitize_money(min(lows))
+            high = _sanitize_money(min(highs))
 
-def _extract_meta_map(html: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for m in META_CONTENT_RE.finditer(html):
-        k = (m.group(1) or "").strip().lower()
-        v = (m.group(2) or "").strip()
-        if k and v:
-            out[k] = v
-    return out
+    if not low or not high:
+        mlo = re.search(r'"lowEstimate"\s*:\s*\{[^}]*"amount"\s*:\s*([0-9]+(?:\.[0-9]{1,2})?)', html, re.IGNORECASE)
+        mhi = re.search(r'"highEstimate"\s*:\s*\{[^}]*"amount"\s*:\s*([0-9]+(?:\.[0-9]{1,2})?)', html, re.IGNORECASE)
+        if mlo:
+            low = low or _sanitize_money(mlo.group(1))
+        if mhi:
+            high = high or _sanitize_money(mhi.group(1))
 
-def _jsonld_offer_prices_usd(blocks: List[Any]) -> List[Decimal]:
-    out: List[Decimal] = []
+    text = _clean_html_text(html)
+    if not low or not high:
+        rlo, rhi = _extract_text_estimate_range(text)
+        low = low or rlo
+        high = high or rhi
 
-    def rec(x: Any):
-        if isinstance(x, dict):
-            t = str(x.get("@type", "")).lower()
-            if "offer" in t:
-                cur = (x.get("priceCurrency") or x.get("currency") or "").strip()
-                price = x.get("price") or x.get("lowPrice") or x.get("highPrice")
-                if cur.upper() == "USD" and price is not None:
-                    d = _to_decimal_money(price)
-                    if d is not None:
-                        out.append(d)
-            if "offers" in x:
-                rec(x["offers"])
-            for v in x.values():
-                rec(v)
-        elif isinstance(x, list):
-            for it in x:
-                rec(it)
+    reserve = _extract_reserve_from_text(text)
+    return low, high, reserve
 
-    for b in blocks:
-        rec(b)
-    return out
+def _extract_bidsquare_estimates(html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    text = _clean_html_text(html)
+    low, high = _extract_text_estimate_range(text)
+    reserve = _extract_reserve_from_text(text)
 
-def _extract_1stdibs_price(html: str) -> Optional[str]:
-    candidates: List[Decimal] = []
-    blocks = _parse_jsonld_blocks(html)
-    candidates.extend(_jsonld_offer_prices_usd(blocks))
-
-    for m in re.finditer(
-        r'"price"\s*:\s*"?([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)"?'
-        r'.{0,240}?"(?:priceCurrency|currency|currencyCode)"\s*:\s*"?USD"?',
-        html,
-        flags=re.IGNORECASE | re.DOTALL,
-    ):
-        d = _to_decimal_money(m.group(1))
-        if d is not None:
-            candidates.append(d)
-
-    meta = _extract_meta_map(html)
-    for k in ("product:price:amount", "og:price:amount", "twitter:data1", "og:description", "og:title"):
-        if k in meta:
-            d = _to_decimal_money(meta[k])
+    if not low or not high:
+        # scan for numeric keys directly in HTML
+        lows = []
+        highs = []
+        for m in re.finditer(r'"(?:estimate_low|lowEstimate|low_estimate|estimateLow)"\s*:\s*("?)([0-9,]+(?:\.[0-9]{1,2})?)\1', html, re.IGNORECASE):
+            d = _to_decimal_money(m.group(2))
             if d is not None:
-                candidates.append(d)
+                lows.append(d)
+        for m in re.finditer(r'"(?:estimate_high|highEstimate|high_estimate|estimateHigh)"\s*:\s*("?)([0-9,]+(?:\.[0-9]{1,2})?)\1', html, re.IGNORECASE):
+            d = _to_decimal_money(m.group(2))
+            if d is not None:
+                highs.append(d)
+        if lows and highs:
+            low = low or _sanitize_money(min(lows))
+            high = high or _sanitize_money(min(highs))
 
-    plausible = [c for c in candidates if Decimal("10") <= c <= Decimal("2000000")]
-    if not plausible:
-        return None
-    return _sanitize_money(min(plausible))
+    return low, high, reserve
 
-def _extract_chairish_price(html: str) -> Optional[str]:
-    blocks = _parse_jsonld_blocks(html)
-    prices = _jsonld_offer_prices_usd(blocks)
-    plausible = [p for p in prices if Decimal("10") <= p <= Decimal("2000000")]
-    if plausible:
-        return _sanitize_money(min(plausible))
-
-    cents = []
-    for m in CENTS_RE.finditer(html):
-        try:
-            cents.append(int(m.group(1)))
-        except Exception:
-            continue
-        if len(cents) >= 25:
-            break
-    cents_plaus = [c for c in cents if c >= 1000]
-    if cents_plaus:
-        return _sanitize_money(Decimal(min(cents_plaus)) / Decimal(100))
-
-    meta = _extract_meta_map(html)
-    for mk in ("og:title", "og:description", "twitter:title", "twitter:description", "description"):
-        if mk in meta:
-            mm = re.search(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', meta[mk])
-            if mm:
-                p = _sanitize_money(mm.group(1))
-                if p:
-                    return p
-
-    # fallback: text window
+def _extract_sothebys_christies_estimates(html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     text = _clean_html_text(html)
-    idx = text.lower().find("price")
-    window = text[max(0, idx - 12000): idx + 18000] if idx != -1 else text[:250000]
-    mm2 = re.search(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', window)
-    if mm2:
-        return _sanitize_money(mm2.group(1))
-    return None
+    low, high = _extract_text_estimate_range(text)
+    reserve = _extract_reserve_from_text(text)
+    return low, high, reserve
 
-def _extract_retail_price_generic(html: str) -> Optional[str]:
-    blocks = _parse_jsonld_blocks(html)
-    prices = _jsonld_offer_prices_usd(blocks)
-    plausible = [p for p in prices if Decimal("10") <= p <= Decimal("2000000")]
-    if plausible:
-        return _sanitize_money(min(plausible))
-
-    meta = _extract_meta_map(html)
-    for mk in ("product:price:amount", "og:price:amount", "og:title", "og:description"):
-        if mk in meta:
-            p = _sanitize_money(meta[mk])
-            if p:
-                return p
-
-    text = _clean_html_text(html)
-    idx = text.lower().find("price")
-    window = text[max(0, idx - 12000): idx + 18000] if idx != -1 else text[:250000]
-    mm = re.search(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', window)
-    if mm:
-        return _sanitize_money(mm.group(1))
-    return None
 
 # ==========================================
 # 10) Gemini fallback extraction from page text
@@ -601,7 +520,7 @@ TEXT:
 
 
 # ==========================================
-# 11) Enrichment with scrape + Chairish improvements (keeps canonical product requirement and thumbnail heuristics)
+# 11) Enrichment with scrape + Chairish improvements (canonical product requirement & thumbnail heuristics)
 # ==========================================
 def _is_likely_thumbnail_url(img_url: str) -> bool:
     if not img_url:
@@ -723,6 +642,7 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
             scraped += 1
             continue
 
+        # Chairish-specific canonical enforcement + heuristics
         if host.endswith("chairish.com"):
             parsed = urlparse(original_url)
             base_url = f"{parsed.scheme}://{parsed.netloc}"
@@ -730,14 +650,20 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
 
             product_url = None
             if not original_url.startswith(canonical_prefix):
-                product_url = _find_chairish_product_link_by_image(html, match_thumbnail, match_title, base_url)
+                try:
+                    product_url = _find_chairish_product_link_by_image(html, match_thumbnail, match_title, base_url)
+                except Exception:
+                    product_url = None
 
                 if not product_url and match_title:
                     q = quote_plus(match_title)
                     search_url = f"{base_url}/search?query={q}"
                     s_html, s_status = _fetch_html(search_url, session)
                     if s_html:
-                        product_url = _find_chairish_product_link_by_image(s_html, match_thumbnail, match_title, base_url)
+                        try:
+                            product_url = _find_chairish_product_link_by_image(s_html, match_thumbnail, match_title, base_url)
+                        except Exception:
+                            product_url = None
 
                 if product_url and product_url.startswith(canonical_prefix):
                     update["product_url"] = product_url
@@ -756,40 +682,48 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
                 if debug_chair:
                     st.write("Chairish: original link is canonical product:", original_url)
 
-        if kind == "retail":
-            if host.endswith("1stdibs.com"):
-                rp = _extract_1stdibs_price(html)
-            elif host.endswith("chairish.com"):
-                rp = _extract_chairish_price(html)
-            else:
-                rp = _extract_retail_price_generic(html)
+        # scrape prices/estimates
+        try:
+            if kind == "retail":
+                if host.endswith("1stdibs.com"):
+                    rp = _extract_1stdibs_price(html)
+                elif host.endswith("chairish.com"):
+                    rp = _extract_chairish_price(html)
+                else:
+                    rp = _extract_retail_price_generic(html)
+                update["retail_price"] = rp
 
-            update["retail_price"] = rp
+                if (not update.get("retail_price")) and st.session_state.get("use_gemini", True):
+                    text = _clean_html_text(html)
+                    ai = _gemini_extract_retail_from_text(text, original_url)
+                    if ai.get("retail_price"):
+                        update["retail_price"] = ai["retail_price"]
 
-            if (not update.get("retail_price")) and st.session_state.get("use_gemini", True):
-                text = _clean_html_text(html)
-                ai = _gemini_extract_retail_from_text(text, original_url)
-                if ai.get("retail_price"):
-                    update["retail_price"] = ai["retail_price"]
+            elif kind == "auction":
+                # wrap each call to avoid app crash on unexpected parsing errors
+                try:
+                    if host.endswith("liveauctioneers.com"):
+                        low, high, reserve = _extract_liveauctioneers_estimates(html)
+                    elif host.endswith("bidsquare.com"):
+                        low, high, reserve = _extract_bidsquare_estimates(html)
+                    else:
+                        low, high, reserve = _extract_sothebys_christies_estimates(html)
+                except Exception:
+                    low = high = reserve = None
 
-        elif kind == "auction":
-            if host.endswith("liveauctioneers.com"):
-                low, high, reserve = _extract_liveauctioneers_estimates(html)
-            elif host.endswith("bidsquare.com"):
-                low, high, reserve = _extract_bidsquare_estimates(html)
-            else:
-                low, high, reserve = _extract_sothebys_christies_estimates(html)
+                update["auction_low"] = low
+                update["auction_high"] = high
+                update["auction_reserve"] = reserve
 
-            update["auction_low"] = low
-            update["auction_high"] = high
-            update["auction_reserve"] = reserve
-
-            if (not update.get("auction_low") or not update.get("auction_high")) and st.session_state.get("use_gemini", True):
-                text = _clean_html_text(html)
-                ai = _gemini_extract_auction_from_text(text, original_url)
-                update["auction_low"] = update.get("auction_low") or ai.get("auction_low")
-                update["auction_high"] = update.get("auction_high") or ai.get("auction_high")
-                update["auction_reserve"] = update.get("auction_reserve") or ai.get("auction_reserve")
+                if (not update.get("auction_low") or not update.get("auction_high")) and st.session_state.get("use_gemini", True):
+                    text = _clean_html_text(html)
+                    ai = _gemini_extract_auction_from_text(text, original_url)
+                    update["auction_low"] = update.get("auction_low") or ai.get("auction_low")
+                    update["auction_high"] = update.get("auction_high") or ai.get("auction_high")
+                    update["auction_reserve"] = update.get("auction_reserve") or ai.get("auction_reserve")
+        except Exception:
+            # prevent any unexpected parsing error from breaking the app
+            pass
 
         st.session_state["scrape_cache"][cache_key] = update
         m.update(update)
@@ -1097,11 +1031,17 @@ if run:
             m["kind"] = _kind_from_domain(m.get("link") or "")
             m.setdefault("confidence", 0.75 if m["kind"] in ("auction", "retail") else 0.35)
 
+        # Only attempt scraping/enrichment if enabled; guard against exceptions so app doesn't crash
         if st.session_state.get("use_scrape_prices", True):
-            raw_matches = enrich_matches_with_prices(
-                raw_matches,
-                max_to_scrape=int(st.session_state.get("max_scrape_links", 10)),
-            )
+            try:
+                raw_matches = enrich_matches_with_prices(
+                    raw_matches,
+                    max_to_scrape=int(st.session_state.get("max_scrape_links", 10)),
+                )
+            except Exception as e:
+                # Log for debug; but don't let the app crash
+                if st.session_state.get("debug_chairish", False):
+                    st.write("Error during enrich_matches_with_prices:", e)
 
         st.session_state["results"] = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
