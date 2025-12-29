@@ -1,4 +1,3 @@
-# (Full file — updated sanitization to strip tags before escaping)
 import os
 import uuid
 import json
@@ -826,11 +825,40 @@ def _strip_tags(v: Any) -> str:
         return ""
     return re.sub(r"<[^>]+>", "", str(v))
 
-def _pill(label: str, value: Any) -> str:
-    # Strip any tags from the value, then HTML-escape — prevents tag fragments from leaking
+def _display_money_value(v: Any) -> str:
+    """
+    Return a clean money string for UI display:
+    - First try _sanitize_money which extracts and formats valid USD values.
+    - If that fails, fall back to extracting the first numeric-looking money piece and formatting it.
+    - If all else fails, return the stripped+escaped original (safe).
+    """
+    if v is None:
+        return "—"
+
+    # Try the canonical sanitizer first (handles Decimal/int/str)
+    sanitized = _sanitize_money(v)
+    if sanitized:
+        return sanitized
+
+    s = str(v)
+
+    # Try to capture the first money-like fragment (e.g., 7,000 or 7000.00)
+    m = MONEY_CAPTURE_RE.search(_strip_tags(s))
+    if m:
+        try:
+            return _format_money(Decimal(m.group(1).replace(",", "")))
+        except Exception:
+            pass
+
+    # As last resort, strip tags and escape
+    stripped = _strip_tags(s).strip()
+    return html_escape(stripped) if stripped else "—"
+
+def _pill_html(label: str, value_text: str) -> str:
+    """Return a sanitized pill span (value_text should be already safe/plain text)."""
     safe_label = html_escape(label)
-    safe_value = html_escape(_strip_tags(value) or "—")
-    return f"<span class=\"pill\">{safe_label}: {safe_value}</span>"
+    safe_value = html_escape(value_text)
+    return f'<span class="pill">{safe_label}: {safe_value}</span>'
 
 def render_match_card_native(m: dict, kind_for_view: str):
     thumb = m.get("thumbnail") or ""
@@ -854,27 +882,36 @@ def render_match_card_native(m: dict, kind_for_view: str):
             st.markdown(f"<span class=\"meta\">Source: {html_escape(source)}</span>", unsafe_allow_html=True)
 
             if kind_for_view == "auction":
-                # build pill list and join with a space so the span boundary isn't interpreted as visible text
-                # also ensure we use stripped values when creating pills
-                pill_list = [
-                    _pill("Low Estimate", _strip_tags(m.get("auction_low")) or "—"),
-                    _pill("High Estimate", _strip_tags(m.get("auction_high")) or "—"),
-                    _pill("Auction Reserve", _strip_tags(m.get("auction_reserve")) or "—"),
-                ]
-                pills_html = " ".join(pill_list)
-                # render inside an isolated HTML iframe to avoid Streamlit markdown mangling
+                # Use the money-display helper to ensure we only render clean values
+                low = _display_money_value(m.get("auction_low"))
+                high = _display_money_value(m.get("auction_high"))
+                reserve = _display_money_value(m.get("auction_reserve"))
+
+                # Build pills using escaped, clean text and render in an isolated HTML block
+                pills_html = (
+                    _pill_html("Low Estimate", low)
+                    + " "
+                    + _pill_html("High Estimate", high)
+                    + " "
+                    + _pill_html("Auction Reserve", reserve)
+                )
                 components.html(
                     f"<div style='display:flex;gap:8px;align-items:center'>{pills_html}</div>",
                     height=56,
                     scrolling=False,
                 )
+
             elif kind_for_view == "retail":
-                # single pill is safe to render via markdown with unsafe HTML
-                st.markdown(_pill("Retail Price", _strip_tags(m.get("retail_price")) or "—"), unsafe_allow_html=True)
+                rp = _display_money_value(m.get("retail_price"))
+                # render single pill via components.html for consistency
+                pill = _pill_html("Retail Price", rp)
+                components.html(f"<div style='display:flex;gap:8px;align-items:center'>{pill}</div>", height=48, scrolling=False)
+
             else:
                 conf = m.get("confidence")
                 if conf is not None:
-                    st.markdown(_pill("Confidence", conf), unsafe_allow_html=True)
+                    # Confidence is not money — show as escaped text
+                    st.markdown(_pill_html("Confidence", str(conf)), unsafe_allow_html=True)
 
             if link:
                 try:
@@ -898,13 +935,12 @@ def _content_context_for_mode(results: dict, mode: str) -> str:
         source = (m.get("source") or "").strip()
         link = (m.get("link") or "").strip()
         if mode == "auction":
-            # ensure values inserted into the AI prompt are stripped of tags
-            low = _strip_tags(m.get("auction_low")) or "—"
-            high = _strip_tags(m.get("auction_high")) or "—"
-            reserve = _strip_tags(m.get("auction_reserve")) or "—"
+            low = _display_money_value(m.get("auction_low")) or "—"
+            high = _display_money_value(m.get("auction_high")) or "—"
+            reserve = _display_money_value(m.get("auction_reserve")) or "—"
             lines.append(f"{i}. {title} | {source} | low={low}, high={high}, reserve={reserve} | {link}")
         else:
-            rp = _strip_tags(m.get("retail_price")) or "—"
+            rp = _display_money_value(m.get("retail_price")) or "—"
             lines.append(f"{i}. {title} | {source} | retail_price={rp} | {link}")
 
     sku = results.get("traceability", {}).get("sku_label", "")
