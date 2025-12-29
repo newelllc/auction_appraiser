@@ -843,7 +843,8 @@ def render_match_card_native(m: dict, kind_for_view: str):
 
         with c2:
             st.markdown(f"**{html_escape(title)}**")
-            st.markdown(f"<span class='meta'>Source: {html_escape(source)}</span>", unsafe_allow_html=True)
+            # use double quotes to keep HTML consistent
+            st.markdown(f"<span class=\"meta\">Source: {html_escape(source)}</span>", unsafe_allow_html=True)
 
             if kind_for_view == "auction":
                 # build pill list and join with a space so the span boundary isn't interpreted as visible text
@@ -853,8 +854,14 @@ def render_match_card_native(m: dict, kind_for_view: str):
                     _pill("Auction Reserve", m.get("auction_reserve") or "—"),
                 ]
                 pills_html = " ".join(pill_list)
-                st.markdown(pills_html, unsafe_allow_html=True)
+                # render inside an isolated HTML iframe to avoid Streamlit markdown mangling
+                components.html(
+                    f"<div style='display:flex;gap:8px;align-items:center'>{pills_html}</div>",
+                    height=56,
+                    scrolling=False,
+                )
             elif kind_for_view == "retail":
+                # single pill is safe to render via markdown with unsafe HTML
                 st.markdown(_pill("Retail Price", m.get("retail_price") or "—"), unsafe_allow_html=True)
             else:
                 conf = m.get("confidence")
@@ -894,12 +901,12 @@ def _content_context_for_mode(results: dict, mode: str) -> str:
     sku = results.get("traceability", {}).get("sku_label", "")
     img_url = results.get("traceability", {}).get("s3", {}).get("presigned_url", "")
 
-    return f\"\"\"SKU: {sku}
+    return f"""SKU: {sku}
 Image URL: {img_url}
 Mode: {mode}
 Reference Listings:
 {chr(10).join(lines)}
-\"\"\".strip()
+""".strip()
 
 def generate_auction_title(results: dict) -> str:
     ctx = _content_context_for_mode(results, "auction")
