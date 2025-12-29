@@ -1,4 +1,7 @@
-# Full app.py with Chairish product-link extraction so "View Listing" points to product pages
+# Full app.py with improved Chairish product-link selection:
+# - If SerpAPI's match link points at a collection page, we fetch the page and choose the product detail URL
+#   that best matches the SerpAPI match title (prefers product links whose surrounding text contains words
+#   from the match title). If none match, we fall back to the first product link found.
 import os
 import uuid
 import json
@@ -687,6 +690,60 @@ TEXT:
 
 
 # ==========================================
+# Helper: find the best Chairish product link on a page based on SerpAPI match title
+# ==========================================
+def _find_chairish_product_link(html: str, match_title: str, base_url: str) -> Optional[str]:
+    """
+    Search html for /product/ links. Score each candidate by how many long words
+    from match_title appear in the surrounding snippet. Return best-scoring absolute URL.
+    If none score > 0, return the first product link found (if any).
+    """
+    candidates: List[Tuple[str, str]] = []
+    for m in re.finditer(r'href=["\']([^"\']+)["\']', html, re.IGNORECASE):
+        href = m.group(1).strip()
+        if "/product/" not in href:
+            continue
+        if href.startswith("http"):
+            url = href
+        else:
+            # join relative path
+            if href.startswith("/"):
+                url = base_url.rstrip("/") + href
+            else:
+                url = base_url.rstrip("/") + "/" + href
+        # capture snippet around the href for scoring
+        start = max(0, m.start() - 200)
+        end = m.end() + 200
+        snippet = html[start:end]
+        candidates.append((url, snippet))
+
+    if not candidates:
+        # fallback: try to match absolute product pattern anywhere
+        pm = re.search(r'(https?://[^"\'>\s]*chairish\.com/product/[^"\'>\s]+)', html, re.IGNORECASE)
+        if pm:
+            return pm.group(1).strip()
+        return None
+
+    # prepare title words (longer words are more informative)
+    words = re.findall(r'\w{4,}', (match_title or "").lower())
+    def score(snippet: str) -> int:
+        s = 0
+        ls = snippet.lower()
+        for w in words:
+            if w in ls:
+                s += 1
+        return s
+
+    scored = [(score(snippet), url) for (url, snippet) in candidates]
+    scored.sort(reverse=True, key=lambda x: x[0])
+    best_score, best_url = scored[0]
+    if best_score > 0:
+        return best_url
+    # no positive score, return first candidate
+    return candidates[0][0]
+
+
+# ==========================================
 # 11) Enrichment with scrape + Gemini fallback
 # ==========================================
 def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> list[dict]:
@@ -715,7 +772,11 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
         m.setdefault("kind", _kind_from_domain(url))
         kind = m.get("kind")
 
+        # Use the original match title when attempting to resolve product pages
+        match_title = (m.get("title") or "").strip()
+
         if url in st.session_state["scrape_cache"]:
+            # cached update may contain an overridden "link" (product_url) already
             m.update(st.session_state["scrape_cache"][url])
             scraped += 1
             continue
@@ -729,26 +790,22 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
             scraped += 1
             continue
 
-        # === NEW: For Chairish retail results, try to find the product detail URL on the page
-        # If we find one, update the stored link to point to the product page (so "View Listing" goes there)
+        # === NEW: For Chairish retail results, prefer the product detail page that best matches the SerpAPI title
         if host.endswith("chairish.com"):
-            product_url = None
-            # Prefer absolute product links if present
-            pm = re.search(r'(https?://[^"\'>\s]*chairish\.com/product/[^"\'>\s]+)', html, re.IGNORECASE)
-            if pm:
-                product_url = pm.group(1).strip()
+            parsed = urlparse(url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            # If the SerpAPI-provided link is not a product (collection/search), try to discover a product link that matches match_title
+            if "/product/" not in url:
+                product_url = _find_chairish_product_link(html, match_title, base_url)
+                if product_url:
+                    update["product_url"] = product_url
+                    # overwrite the link that will be used by the UI so "View Listing" points to the product details
+                    update["link"] = product_url
             else:
-                # Look for relative hrefs like /product/12345/...
-                pm2 = re.search(r'href=["\'](/product/[^"\']+)["\']', html, re.IGNORECASE)
-                if pm2:
-                    parsed = urlparse(url)
-                    product_url = f"{parsed.scheme}://{parsed.netloc}{pm2.group(1).strip()}"
-            if product_url:
-                update["product_url"] = product_url
-                # Overwrite link so UI points to the product page
-                update["link"] = product_url
+                # If the provided link already points at a product, keep it but still set product_url for traceability
+                update["product_url"] = url
 
-        # === scrape first ===
+        # === scrape price/data next ===
         if kind == "retail":
             if host.endswith("1stdibs.com"):
                 rp = _extract_1stdibs_price(html)
