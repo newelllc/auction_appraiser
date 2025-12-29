@@ -1,5 +1,5 @@
-# Full app.py — Chairish product-link resolution: accept only canonical product URLs and exclude obvious thumbnail image URLs.
-# No Pillow dependency; uses heuristic thumbnail-url exclusion (e.g., "fit&width=265&height=265", width/height params, "thumb", "thumbnail").
+# Full app.py — fixed: restores missing UI, retains Chairish canonical-product + thumbnail heuristics
+# No Pillow dependency; only accepts canonical Chairish product URLs and excludes obvious thumbnail image URLs.
 import os
 import uuid
 import json
@@ -339,7 +339,7 @@ def _try_login_liveauctioneers(session: requests.Session) -> bool:
 
 
 # ==========================================
-# 9) Domain extractors (unchanged for brevity)
+# 9) Domain extractors (original retail extractors restored)
 # ==========================================
 DOLLAR_RANGE_RE = re.compile(
     r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:-|–|to)\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)',
@@ -361,6 +361,7 @@ def _extract_text_estimate_range(text: str) -> Tuple[Optional[str], Optional[str
     if idx != -1:
         windows.append(text[max(0, idx - 10000): idx + 10000])
     windows.append(text[:250000])
+
     for w in windows:
         m = DOLLAR_RANGE_RE.search(w)
         if m:
@@ -368,6 +369,7 @@ def _extract_text_estimate_range(text: str) -> Tuple[Optional[str], Optional[str
         m2 = USD_RANGE_RE.search(w)
         if m2:
             return _sanitize_range(m2.group(1), m2.group(2))
+
         m3 = re.search(
             r'(?:estimate[^0-9]{0,60})\b([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:-|–|to)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)',
             w,
@@ -375,6 +377,7 @@ def _extract_text_estimate_range(text: str) -> Tuple[Optional[str], Optional[str
         )
         if m3:
             return _sanitize_range(m3.group(1), m3.group(2))
+
     return None, None
 
 def _extract_reserve_from_text(text: str) -> Optional[str]:
@@ -418,8 +421,14 @@ def _walk_find_numbers(obj: Any, keys: List[str]) -> List[Decimal]:
     rec(obj)
     return found
 
-JSONLD_RE = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.IGNORECASE | re.DOTALL)
-META_CONTENT_RE = re.compile(r'<meta[^>]+(?:property|name)=["\']([^"\']+)["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE)
+JSONLD_RE = re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
+META_CONTENT_RE = re.compile(
+    r'<meta[^>]+(?:property|name)=["\']([^"\']+)["\'][^>]+content=["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
 
 def _parse_jsonld_blocks(html: str) -> List[Any]:
     blocks: List[Any] = []
@@ -444,6 +453,7 @@ def _extract_meta_map(html: str) -> Dict[str, str]:
 
 def _jsonld_offer_prices_usd(blocks: List[Any]) -> List[Decimal]:
     out: List[Decimal] = []
+
     def rec(x: Any):
         if isinstance(x, dict):
             t = str(x.get("@type", "")).lower()
@@ -461,30 +471,148 @@ def _jsonld_offer_prices_usd(blocks: List[Any]) -> List[Decimal]:
         elif isinstance(x, list):
             for it in x:
                 rec(it)
+
     for b in blocks:
         rec(b)
     return out
 
-# (Retail extraction functions continue unchanged: _extract_1stdibs_price, _extract_chairish_price, etc.)
-# For brevity these are the same as prior version — the key changes below modify Chairish candidate filtering.
+def _extract_1stdibs_price(html: str) -> Optional[str]:
+    candidates: List[Decimal] = []
+    blocks = _parse_jsonld_blocks(html)
+    candidates.extend(_jsonld_offer_prices_usd(blocks))
+
+    for m in re.finditer(
+        r'"price"\s*:\s*"?([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)"?'
+        r'.{0,240}?"(?:priceCurrency|currency|currencyCode)"\s*:\s*"?USD"?',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        d = _to_decimal_money(m.group(1))
+        if d is not None:
+            candidates.append(d)
+
+    meta = _extract_meta_map(html)
+    for k in ("product:price:amount", "og:price:amount", "twitter:data1", "og:description", "og:title"):
+        if k in meta:
+            d = _to_decimal_money(meta[k])
+            if d is not None:
+                candidates.append(d)
+
+    plausible = [c for c in candidates if Decimal("10") <= c <= Decimal("2000000")]
+    if not plausible:
+        return None
+    return _sanitize_money(min(plausible))
+
+def _extract_chairish_price(html: str) -> Optional[str]:
+    blocks = _parse_jsonld_blocks(html)
+    prices = _jsonld_offer_prices_usd(blocks)
+    plausible = [p for p in prices if Decimal("10") <= p <= Decimal("2000000")]
+    if plausible:
+        return _sanitize_money(min(plausible))
+
+    cents = []
+    for m in CENTS_RE.finditer(html):
+        try:
+            cents.append(int(m.group(1)))
+        except Exception:
+            continue
+        if len(cents) >= 25:
+            break
+    cents_plaus = [c for c in cents if c >= 1000]
+    if cents_plaus:
+        return _sanitize_money(Decimal(min(cents_plaus)) / Decimal(100))
+
+    meta = _extract_meta_map(html)
+    for mk in ("og:title", "og:description", "twitter:title", "twitter:description", "description"):
+        if mk in meta:
+            mm = re.search(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', meta[mk])
+            if mm:
+                p = _sanitize_money(mm.group(1))
+                if p:
+                    return p
+
+    # fallback: text window
+    text = _clean_html_text(html)
+    idx = text.lower().find("price")
+    window = text[max(0, idx - 12000): idx + 18000] if idx != -1 else text[:250000]
+    mm2 = re.search(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', window)
+    if mm2:
+        return _sanitize_money(mm2.group(1))
+    return None
+
+def _extract_retail_price_generic(html: str) -> Optional[str]:
+    blocks = _parse_jsonld_blocks(html)
+    prices = _jsonld_offer_prices_usd(blocks)
+    plausible = [p for p in prices if Decimal("10") <= p <= Decimal("2000000")]
+    if plausible:
+        return _sanitize_money(min(plausible))
+
+    meta = _extract_meta_map(html)
+    for mk in ("product:price:amount", "og:price:amount", "og:title", "og:description"):
+        if mk in meta:
+            p = _sanitize_money(meta[mk])
+            if p:
+                return p
+
+    text = _clean_html_text(html)
+    idx = text.lower().find("price")
+    window = text[max(0, idx - 12000): idx + 18000] if idx != -1 else text[:250000]
+    mm = re.search(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', window)
+    if mm:
+        return _sanitize_money(mm.group(1))
+    return None
 
 # ==========================================
-# Helpers: thumbnail-url heuristics + product-candidate finder
+# 10) Gemini fallback extraction from page text
+# ==========================================
+def _gemini_extract_auction_from_text(page_text: str, url: str) -> Dict[str, Optional[str]]:
+    page_text = page_text[:14000]
+    prompt = f"""
+Extract auction estimate values from the text below (source URL included).
+Return ONLY JSON: {{"low_estimate":"$...","high_estimate":"$...","reserve":"$..."}}.
+If any value is not present, set it to null. Do not guess.
+
+URL: {url}
+
+TEXT:
+{page_text}
+"""
+    data = _gemini_json(prompt)
+    out = {
+        "auction_low": _sanitize_money(data.get("low_estimate")),
+        "auction_high": _sanitize_money(data.get("high_estimate")),
+        "auction_reserve": _sanitize_money(data.get("reserve")),
+    }
+    return out
+
+def _gemini_extract_retail_from_text(page_text: str, url: str) -> Dict[str, Optional[str]]:
+    page_text = page_text[:14000]
+    prompt = f"""
+Extract the retail listing price from the text below (source URL included).
+Return ONLY JSON: {{"retail_price":"$..."}}. If not present, retail_price must be null. Do not guess.
+
+URL: {url}
+
+TEXT:
+{page_text}
+"""
+    data = _gemini_json(prompt)
+    return {"retail_price": _sanitize_money(data.get("retail_price"))}
+
+
+# ==========================================
+# 11) Enrichment with scrape + Chairish improvements (keeps canonical product requirement and thumbnail heuristics)
 # ==========================================
 def _is_likely_thumbnail_url(img_url: str) -> bool:
-    """Return True if the image URL looks like a small thumbnail (by query params or path tokens)."""
     if not img_url:
         return False
     low = img_url.lower()
-    # Common tiny-thumbnail patterns used by Chairish/others
     if "fit&width=265&height=265" in low or "width=265" in low or "height=265" in low:
         return True
-    # other small sizes often used in collection grid
     if re.search(r'width=\d+&height=\d+', low):
         m = re.search(r'width=(\d+)', low)
         if m and int(m.group(1)) < 500:
             return True
-    # some thumbnails use "thumb", "thumbnail", "small"
     if any(tok in low for tok in ("/thumbs/", "/thumbnail", "thumbnail=", "thumb=", "/small", "/w_")):
         return True
     return False
@@ -505,7 +633,6 @@ def _score_candidate_by_image_and_title(candidate_snippet: str, candidate_img_sr
             score += 50
         else:
             score += 5
-    # Title word overlap
     snippet_lower = (candidate_snippet or "").lower()
     for w in match_title_words:
         if w in snippet_lower:
@@ -513,28 +640,18 @@ def _score_candidate_by_image_and_title(candidate_snippet: str, candidate_img_sr
     return score
 
 def _find_chairish_product_link_by_image(html: str, match_thumbnail: Optional[str], match_title: str, base_url: str) -> Optional[str]:
-    """
-    Find /product/ anchors on the page, score them by image filename + title overlap,
-    but only consider product URLs that will resolve to the canonical product prefix.
-    """
-    # canonical product prefix to enforce
     canonical_prefix = f"{base_url.rstrip('/')}/product/"
     match_thumb_basename = _basename_from_url(match_thumbnail) if match_thumbnail else ""
     title_words = re.findall(r'\w{4,}', (match_title or "").lower())
 
     candidates: List[Tuple[int, str]] = []
 
-    # Find anchors that link to /product/ and capture inner HTML snippet
     for m in re.finditer(r'<a[^>]+href=["\']([^"\']*?/product/[^"\']+)["\'][^>]*>(.*?)</a>', html, flags=re.IGNORECASE | re.DOTALL):
         href = m.group(1).strip()
         inner = m.group(2) or ""
-        # normalize to absolute URL
         full_href = href if href.startswith("http") else urljoin(base_url, href)
-        # enforce canonical product URL string startswith
         if not full_href.startswith(canonical_prefix):
-            # skip non-canonical product-like hrefs (e.g., odd redirects or tracking)
             continue
-        # find image inside anchor (if any)
         img_m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', inner, flags=re.IGNORECASE)
         img_src = img_m.group(1).strip() if img_m else ""
         if img_src and img_src.startswith("/"):
@@ -545,7 +662,6 @@ def _find_chairish_product_link_by_image(html: str, match_thumbnail: Optional[st
         score = _score_candidate_by_image_and_title(snippet, img_src, match_thumb_basename, title_words)
         candidates.append((score, full_href))
 
-    # If no anchor-based candidates, fall back to finding any absolute product URLs on the page
     if not candidates:
         for m in re.finditer(r'(https?://[^"\'>\s]*chairish\.com/product/[^"\'>\s]+)', html, re.IGNORECASE):
             url = m.group(1).strip()
@@ -555,24 +671,17 @@ def _find_chairish_product_link_by_image(html: str, match_thumbnail: Optional[st
     if not candidates:
         return None
 
-    # choose best-scoring candidate
     candidates.sort(reverse=True, key=lambda x: x[0])
     best_score, best_url = candidates[0]
-    # require at least minimal score (>=1) and that URL begins with canonical prefix
     if best_score >= 1 and best_url.startswith(canonical_prefix):
         return best_url
     return None
 
-
-# ==========================================
-# 11) Enrichment with scrape + Gemini fallback (Chairish fixes applied)
-# ==========================================
 def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> list[dict]:
     if "scrape_cache" not in st.session_state:
         st.session_state["scrape_cache"] = {}
     session = _get_session()
 
-    # Optional login for LA
     if st.session_state.get("use_la_login", False):
         _try_login_liveauctioneers(session)
 
@@ -614,7 +723,6 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
             scraped += 1
             continue
 
-        # Chairish-specific: strict canonical product acceptance + thumbnail exclusions
         if host.endswith("chairish.com"):
             parsed = urlparse(original_url)
             base_url = f"{parsed.scheme}://{parsed.netloc}"
@@ -622,10 +730,8 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
 
             product_url = None
             if not original_url.startswith(canonical_prefix):
-                # try image+title on the page, but only accept candidate URLs that resolve to canonical product prefix
                 product_url = _find_chairish_product_link_by_image(html, match_thumbnail, match_title, base_url)
 
-                # fallback: explicit site search if not found
                 if not product_url and match_title:
                     q = quote_plus(match_title)
                     search_url = f"{base_url}/search?query={q}"
@@ -646,12 +752,10 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
                         st.write(" original:", original_url)
                         st.write(" candidate product_url:", product_url)
             else:
-                # original link already a canonical product URL — preserve it and store for traceability
                 update["product_url"] = original_url
                 if debug_chair:
                     st.write("Chairish: original link is canonical product:", original_url)
 
-        # scrape price/data next
         if kind == "retail":
             if host.endswith("1stdibs.com"):
                 rp = _extract_1stdibs_price(html)
@@ -662,7 +766,6 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
 
             update["retail_price"] = rp
 
-            # gemini fallback if missing
             if (not update.get("retail_price")) and st.session_state.get("use_gemini", True):
                 text = _clean_html_text(html)
                 ai = _gemini_extract_retail_from_text(text, original_url)
@@ -681,7 +784,6 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
             update["auction_high"] = high
             update["auction_reserve"] = reserve
 
-            # gemini fallback for auction values
             if (not update.get("auction_low") or not update.get("auction_high")) and st.session_state.get("use_gemini", True):
                 text = _clean_html_text(html)
                 ai = _gemini_extract_auction_from_text(text, original_url)
@@ -740,7 +842,7 @@ def export_to_google_sheets(results: dict):
 
 
 # ==========================================
-# 13) UI RENDERER (unchanged except debug toggle)
+# 13) UI RENDERER (HTML-escaped values)
 # ==========================================
 def _strip_tags(v: Any) -> str:
     if v is None:
@@ -789,15 +891,17 @@ def render_match_card_native(m: dict, kind_for_view: str):
             st.markdown(f"<span class=\"meta\">Source: {html_escape(source)}</span>", unsafe_allow_html=True)
 
             if kind_for_view == "auction":
-                low = _display_money_value(m.get("auction_low"))
-                high = _display_money_value(m.get("auction_high"))
-                reserve = _display_money_value(m.get("auction_reserve"))
-                pills_html = _pill_html("Low Estimate", low) + " " + _pill_html("High Estimate", high) + " " + _pill_html("Auction Reserve", reserve)
+                pills_html = (
+                    _pill_html("Low Estimate", _display_money_value(m.get("auction_low")))
+                    + " "
+                    + _pill_html("High Estimate", _display_money_value(m.get("auction_high")))
+                    + " "
+                    + _pill_html("Auction Reserve", _display_money_value(m.get("auction_reserve")))
+                )
                 components.html(f"<div style='display:flex;gap:8px;align-items:center'>{pills_html}</div>", height=56, scrolling=False)
 
             elif kind_for_view == "retail":
-                rp = _display_money_value(m.get("retail_price"))
-                pill = _pill_html("Retail Price", rp)
+                pill = _pill_html("Retail Price", _display_money_value(m.get("retail_price")))
                 components.html(f"<div style='display:flex;gap:8px;align-items:center'>{pill}</div>", height=48, scrolling=False)
 
             else:
@@ -815,11 +919,12 @@ def render_match_card_native(m: dict, kind_for_view: str):
 
 
 # ==========================================
-# 14) CONTENT GENERATION (unchanged)
+# 14) CONTENT GENERATION (Gemini)
 # ==========================================
 def _content_context_for_mode(results: dict, mode: str) -> str:
     matches = results.get("traceability", {}).get("search_summary", {}).get("top_matches", [])
     relevant = [m for m in matches if m.get("kind") == mode][:6]
+
     lines = []
     for i, m in enumerate(relevant, start=1):
         title = (m.get("title") or "").strip()
@@ -836,6 +941,7 @@ def _content_context_for_mode(results: dict, mode: str) -> str:
 
     sku = results.get("traceability", {}).get("sku_label", "")
     img_url = results.get("traceability", {}).get("s3", {}).get("presigned_url", "")
+
     return f"""SKU: {sku}
 Image URL: {img_url}
 Mode: {mode}
@@ -910,7 +1016,7 @@ Return ONLY a comma-separated list.
 
 
 # ==========================================
-# 15) SIDEBAR + MAIN UI (added debug checkbox)
+# 15) SIDEBAR + MAIN UI
 # ==========================================
 if "content_outputs" not in st.session_state:
     st.session_state["content_outputs"] = {
@@ -926,13 +1032,175 @@ with st.sidebar:
     st.toggle("AI Mode", value=True, key="use_gemini")
     st.toggle("Scrape prices/estimates from listing pages", value=True, key="use_scrape_prices")
     st.slider("Max listing links to process per run", 0, 20, 10, key="max_scrape_links")
+
     st.toggle("Use LiveAuctioneers Login (optional)", value=False, key="use_la_login")
     st.caption("Add LIVEAUCTIONEERS_USERNAME and LIVEAUCTIONEERS_PASSWORD in Streamlit secrets to enable.")
+
     st.divider()
     st.checkbox("Debug Chairish linking", value=False, key="debug_chairish")
     sku = st.session_state.get("uploaded_image_meta", {}).get("filename", "N/A")
     st.markdown(f"**SKU Label:** `{sku}`")
 
-# --- Main UI and run flow remain the same (unchanged) ---
-# (Rest of app code continues unchanged — upload, Run Appraisal, Results, Content Generation)
-# For brevity the remaining UI code is identical to previous versions and omitted here.
+st.markdown("<h1>Newel Appraiser</h1>", unsafe_allow_html=True)
+
+st.header("1. Upload Item Image")
+uploaded_file = st.file_uploader("Upload item photo for appraisal", type=["jpg", "jpeg", "png"])
+
+if uploaded_file:
+    st.session_state["uploaded_image_bytes"] = uploaded_file.getvalue()
+    st.session_state["uploaded_image_meta"] = {"filename": uploaded_file.name, "content_type": uploaded_file.type}
+    st.image(uploaded_file, width=420)
+
+st.header("2. Run Appraisal")
+run = st.button("Run Appraisal", disabled=not uploaded_file)
+
+if run:
+    with st.spinner("Processing..."):
+        s3 = boto3.client(
+            "s3",
+            region_name=_get_secret("AWS_REGION"),
+            aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"),
+        )
+
+        key = f"uploads/{uuid.uuid4().hex}_{uploaded_file.name}"
+        s3.put_object(
+            Bucket=_get_secret("S3_BUCKET"),
+            Key=key,
+            Body=st.session_state["uploaded_image_bytes"],
+            ContentType=st.session_state["uploaded_image_meta"]["content_type"],
+        )
+
+        presigned_url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": _get_secret("S3_BUCKET"), "Key": key},
+            ExpiresIn=3600,
+        )
+
+        lens = requests.get(
+            "https://serpapi.com/search.json",
+            params={"engine": "google_lens", "url": presigned_url, "api_key": _get_secret("SERPAPI_API_KEY")},
+            timeout=60,
+        ).json()
+
+        raw_matches = [
+            {
+                "title": i.get("title"),
+                "source": i.get("source"),
+                "link": i.get("link"),
+                "thumbnail": i.get("thumbnail"),
+            }
+            for i in lens.get("visual_matches", [])[:18]
+        ]
+
+        for m in raw_matches:
+            m["kind"] = _kind_from_domain(m.get("link") or "")
+            m.setdefault("confidence", 0.75 if m["kind"] in ("auction", "retail") else 0.35)
+
+        if st.session_state.get("use_scrape_prices", True):
+            raw_matches = enrich_matches_with_prices(
+                raw_matches,
+                max_to_scrape=int(st.session_state.get("max_scrape_links", 10)),
+            )
+
+        st.session_state["results"] = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "traceability": {
+                "sku_label": st.session_state.get("uploaded_image_meta", {}).get("filename", ""),
+                "s3": {"presigned_url": presigned_url},
+                "search_summary": {"top_matches": raw_matches},
+            },
+        }
+
+        st.session_state["content_outputs"] = {
+            "auction_title": "",
+            "auction_description": "",
+            "newel_title": "",
+            "newel_description": "",
+            "keywords": "",
+        }
+
+st.header("3. Results")
+
+res = st.session_state.get("results")
+if not res:
+    st.info("No appraisal run yet. Upload a photo above to begin.")
+else:
+    view_mode = st.radio(
+        "View",
+        options=["Auction Results", "Retail Listings", "Other Matches"],
+        horizontal=True,
+        key="results_view_mode",
+        label_visibility="collapsed",
+    )
+
+    left_col, right_col = st.columns([1.35, 1.0], gap="large")
+
+    with left_col:
+        matches = res.get("traceability", {}).get("search_summary", {}).get("top_matches", [])
+        if view_mode == "Auction Results":
+            subset = [m for m in matches if m.get("kind") == "auction"]
+            if not subset:
+                st.info("No auction matches found.")
+            for m in subset:
+                render_match_card_native(m, kind_for_view="auction")
+
+        elif view_mode == "Retail Listings":
+            subset = [m for m in matches if m.get("kind") == "retail"]
+            if not subset:
+                st.info("No retail matches found.")
+            for m in subset:
+                render_match_card_native(m, kind_for_view="retail")
+
+        else:
+            subset = [m for m in matches if m.get("kind") not in ("auction", "retail")]
+            if not subset:
+                st.info("No other matches.")
+            for m in subset:
+                render_match_card_native(m, kind_for_view="other")
+
+        st.divider()
+        if st.button("Export to Google Sheets"):
+            with st.spinner("Exporting rows..."):
+                try:
+                    export_to_google_sheets(res)
+                    st.toast("Successfully exported to Sheets!")
+                    st.markdown(f"[View Master Sheet]({_get_secret('GOOGLE_SHEET_URL')})")
+                except Exception as e:
+                    st.error(f"Export failed: {e}")
+
+    with right_col:
+        st.header("4. Content Generation")
+        if not st.session_state.get("use_gemini", True):
+            st.info("Turn on **AI Mode** in the sidebar to generate content.")
+        else:
+            if view_mode == "Auction Results":
+                st.subheader("Auction Content")
+                if st.button("Generate Auction Title"):
+                    with st.spinner("Generating Auction Title..."):
+                        st.session_state["content_outputs"]["auction_title"] = generate_auction_title(res)
+                st.text_area("Auction Title", value=st.session_state["content_outputs"].get("auction_title", ""), height=90)
+
+                if st.button("Generate Auction Description"):
+                    with st.spinner("Generating Auction Description..."):
+                        st.session_state["content_outputs"]["auction_description"] = generate_auction_description(res)
+                st.text_area("Auction Description", value=st.session_state["content_outputs"].get("auction_description", ""), height=240)
+
+            elif view_mode == "Retail Listings":
+                st.subheader("Newel Content")
+                if st.button("Generate Newel Title"):
+                    with st.spinner("Generating Newel Title..."):
+                        st.session_state["content_outputs"]["newel_title"] = generate_newel_title(res)
+                st.text_area("Newel Title", value=st.session_state["content_outputs"].get("newel_title", ""), height=90)
+
+                if st.button("Generate Newel Description"):
+                    with st.spinner("Generating Newel Description..."):
+                        st.session_state["content_outputs"]["newel_description"] = generate_newel_description(res)
+                st.text_area("Newel Description", value=st.session_state["content_outputs"].get("newel_description", ""), height=240)
+
+                if st.button("Generate keywords"):
+                    with st.spinner("Generating keywords..."):
+                        st.session_state["content_outputs"]["keywords"] = generate_keywords(res)
+                st.text_area("SEO Keywords", value=st.session_state["content_outputs"].get("keywords", ""), height=150)
+            else:
+                st.info("Select **Auction Results** or **Retail Listings** to generate content.")
