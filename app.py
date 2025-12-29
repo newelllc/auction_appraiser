@@ -1,10 +1,11 @@
-# Full app.py — fixed: restores missing auction extraction functions and makes enrichment robust.
+# Full app.py — fixed: restores missing auction extraction functions and adds traceback capture in-app.
 # Keeps Chairish canonical-product + thumbnail heuristics; does not add Pillow.
 import os
 import uuid
 import json
 import time
 import re
+import traceback
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin, quote_plus
@@ -700,7 +701,6 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
                         update["retail_price"] = ai["retail_price"]
 
             elif kind == "auction":
-                # wrap each call to avoid app crash on unexpected parsing errors
                 try:
                     if host.endswith("liveauctioneers.com"):
                         low, high, reserve = _extract_liveauctioneers_estimates(html)
@@ -989,76 +989,88 @@ st.header("2. Run Appraisal")
 run = st.button("Run Appraisal", disabled=not uploaded_file)
 
 if run:
+    # Wrap the entire processing in try/except and display full traceback in-app for debugging
     with st.spinner("Processing..."):
-        s3 = boto3.client(
-            "s3",
-            region_name=_get_secret("AWS_REGION"),
-            aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"),
-        )
+        try:
+            s3 = boto3.client(
+                "s3",
+                region_name=_get_secret("AWS_REGION"),
+                aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"),
+            )
 
-        key = f"uploads/{uuid.uuid4().hex}_{uploaded_file.name}"
-        s3.put_object(
-            Bucket=_get_secret("S3_BUCKET"),
-            Key=key,
-            Body=st.session_state["uploaded_image_bytes"],
-            ContentType=st.session_state["uploaded_image_meta"]["content_type"],
-        )
+            key = f"uploads/{uuid.uuid4().hex}_{uploaded_file.name}"
+            s3.put_object(
+                Bucket=_get_secret("S3_BUCKET"),
+                Key=key,
+                Body=st.session_state["uploaded_image_bytes"],
+                ContentType=st.session_state["uploaded_image_meta"]["content_type"],
+            )
 
-        presigned_url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": _get_secret("S3_BUCKET"), "Key": key},
-            ExpiresIn=3600,
-        )
+            presigned_url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": _get_secret("S3_BUCKET"), "Key": key},
+                ExpiresIn=3600,
+            )
 
-        lens = requests.get(
-            "https://serpapi.com/search.json",
-            params={"engine": "google_lens", "url": presigned_url, "api_key": _get_secret("SERPAPI_API_KEY")},
-            timeout=60,
-        ).json()
+            lens = requests.get(
+                "https://serpapi.com/search.json",
+                params={"engine": "google_lens", "url": presigned_url, "api_key": _get_secret("SERPAPI_API_KEY")},
+                timeout=60,
+            ).json()
 
-        raw_matches = [
-            {
-                "title": i.get("title"),
-                "source": i.get("source"),
-                "link": i.get("link"),
-                "thumbnail": i.get("thumbnail"),
+            raw_matches = [
+                {
+                    "title": i.get("title"),
+                    "source": i.get("source"),
+                    "link": i.get("link"),
+                    "thumbnail": i.get("thumbnail"),
+                }
+                for i in lens.get("visual_matches", [])[:18]
+            ]
+
+            for m in raw_matches:
+                m["kind"] = _kind_from_domain(m.get("link") or "")
+                m.setdefault("confidence", 0.75 if m["kind"] in ("auction", "retail") else 0.35)
+
+            # Only attempt scraping/enrichment if enabled; guard against exceptions so app doesn't crash
+            if st.session_state.get("use_scrape_prices", True):
+                try:
+                    raw_matches = enrich_matches_with_prices(
+                        raw_matches,
+                        max_to_scrape=int(st.session_state.get("max_scrape_links", 10)),
+                    )
+                except Exception as e:
+                    # capture and show traceback in-app
+                    tb = traceback.format_exc()
+                    st.error("Error during enrich_matches_with_prices — full traceback follows below.")
+                    st.code(tb)
+                    # preserve raw_matches as-is so UI can still show SerpAPI results
+            # save results
+            st.session_state["results"] = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "traceability": {
+                    "sku_label": st.session_state.get("uploaded_image_meta", {}).get("filename", ""),
+                    "s3": {"presigned_url": presigned_url},
+                    "search_summary": {"top_matches": raw_matches},
+                },
             }
-            for i in lens.get("visual_matches", [])[:18]
-        ]
 
-        for m in raw_matches:
-            m["kind"] = _kind_from_domain(m.get("link") or "")
-            m.setdefault("confidence", 0.75 if m["kind"] in ("auction", "retail") else 0.35)
+            st.session_state["content_outputs"] = {
+                "auction_title": "",
+                "auction_description": "",
+                "newel_title": "",
+                "newel_description": "",
+                "keywords": "",
+            }
 
-        # Only attempt scraping/enrichment if enabled; guard against exceptions so app doesn't crash
-        if st.session_state.get("use_scrape_prices", True):
-            try:
-                raw_matches = enrich_matches_with_prices(
-                    raw_matches,
-                    max_to_scrape=int(st.session_state.get("max_scrape_links", 10)),
-                )
-            except Exception as e:
-                # Log for debug; but don't let the app crash
-                if st.session_state.get("debug_chairish", False):
-                    st.write("Error during enrich_matches_with_prices:", e)
-
-        st.session_state["results"] = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "traceability": {
-                "sku_label": st.session_state.get("uploaded_image_meta", {}).get("filename", ""),
-                "s3": {"presigned_url": presigned_url},
-                "search_summary": {"top_matches": raw_matches},
-            },
-        }
-
-        st.session_state["content_outputs"] = {
-            "auction_title": "",
-            "auction_description": "",
-            "newel_title": "",
-            "newel_description": "",
-            "keywords": "",
-        }
+        except Exception as e:
+            tb = traceback.format_exc()
+            # Show clear UI feedback + full traceback for debugging
+            st.error("An unexpected error occurred while running the appraisal. Full traceback:")
+            st.code(tb)
+            # Also store in session for later inspection
+            st.session_state["last_run_traceback"] = tb
 
 st.header("3. Results")
 
