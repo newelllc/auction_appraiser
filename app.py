@@ -1,7 +1,7 @@
-# Full app.py with improved Chairish product-link selection:
-# - If SerpAPI's match link points at a collection page, we fetch the page and choose the product detail URL
-#   that best matches the SerpAPI match title (prefers product links whose surrounding text contains words
-#   from the match title). If none match, we fall back to the first product link found.
+# Full app.py with improved Chairish product-link resolution using image matching + title fallback.
+# This replicates the auction-path logic: when SerpAPI match points to a collection/search page,
+# we inspect the HTML to find product detail links and pick the product whose product-image or
+# surrounding text best matches the SerpAPI visual match (thumbnail + title).
 import os
 import uuid
 import json
@@ -9,7 +9,7 @@ import time
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from html import escape as html_escape
 
 import boto3
@@ -690,57 +690,93 @@ TEXT:
 
 
 # ==========================================
-# Helper: find the best Chairish product link on a page based on SerpAPI match title
+# Helper: image-based Chairish product link finder
 # ==========================================
-def _find_chairish_product_link(html: str, match_title: str, base_url: str) -> Optional[str]:
+def _basename_from_url(u: str) -> str:
+    if not u:
+        return ""
+    u = u.split("?")[0].split("#")[0]
+    return os.path.basename(u)
+
+def _score_candidate_by_image_and_title(candidate_snippet: str, candidate_img_src: str, match_thumb_basename: str, match_title_words: List[str]) -> int:
+    score = 0
+    if candidate_img_src:
+        cand_basename = _basename_from_url(candidate_img_src).lower()
+        if match_thumb_basename and cand_basename == match_thumb_basename.lower():
+            score += 100
+        elif match_thumb_basename and match_thumb_basename.lower() in cand_basename:
+            score += 50
+        elif candidate_img_src.lower().endswith(".jpg") or candidate_img_src.lower().endswith(".png"):
+            score += 5
+
+    # Title word overlap
+    snippet_lower = (candidate_snippet or "").lower()
+    for w in match_title_words:
+        if w in snippet_lower:
+            score += 10
+    return score
+
+def _find_chairish_product_link_by_image(html: str, match_thumbnail: Optional[str], match_title: str, base_url: str) -> Optional[str]:
     """
-    Search html for /product/ links. Score each candidate by how many long words
-    from match_title appear in the surrounding snippet. Return best-scoring absolute URL.
-    If none score > 0, return the first product link found (if any).
+    Look for <a ... href="/product/..."> ... <img src="..."> ... </a> patterns.
+    Score candidates by:
+      - image filename equality / containment with SerpAPI thumbnail filename
+      - overlap of long words from match_title with surrounding snippet
+    Return best-scoring absolute URL, or None if none found.
     """
-    candidates: List[Tuple[str, str]] = []
-    for m in re.finditer(r'href=["\']([^"\']+)["\']', html, re.IGNORECASE):
+    # normalize match thumbnail filename
+    match_thumb_basename = _basename_from_url(match_thumbnail) if match_thumbnail else ""
+
+    # long words from title
+    title_words = re.findall(r'\w{4,}', (match_title or "").lower())
+
+    candidates: List[Tuple[int, str]] = []
+
+    # find anchors that contain /product/ and capture the inner HTML for snippet
+    for m in re.finditer(r'<a[^>]+href=["\']([^"\']*?/product/[^"\']+)["\'][^>]*>(.*?)</a>', html, flags=re.IGNORECASE | re.DOTALL):
         href = m.group(1).strip()
-        if "/product/" not in href:
-            continue
-        if href.startswith("http"):
-            url = href
-        else:
-            # join relative path
-            if href.startswith("/"):
-                url = base_url.rstrip("/") + href
-            else:
-                url = base_url.rstrip("/") + "/" + href
-        # capture snippet around the href for scoring
+        inner = m.group(2) or ""
+        # look for an <img src=...> inside inner
+        img_m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', inner, flags=re.IGNORECASE)
+        img_src = img_m.group(1).strip() if img_m else ""
+        # if img_src is relative, build absolute
+        if img_src and img_src.startswith("/"):
+            img_src = urljoin(base_url, img_src)
+        # build snippet for scoring (inner + some context)
         start = max(0, m.start() - 200)
-        end = m.end() + 200
+        end = min(len(html), m.end() + 200)
         snippet = html[start:end]
-        candidates.append((url, snippet))
+        score = _score_candidate_by_image_and_title(snippet, img_src, match_thumb_basename, title_words)
+        # small bonus if href contains slug words from title
+        href_low = href.lower()
+        for w in title_words[:4]:
+            if w in href_low:
+                score += 5
+        # normalize href to absolute
+        if href.startswith("http"):
+            full = href
+        else:
+            full = urljoin(base_url, href)
+        candidates.append((score, full))
+
+    # If we didn't find <a> blocks, fallback to any product URL in page
+    if not candidates:
+        for m in re.finditer(r'(https?://[^"\'>\s]*chairish\.com/product/[^"\'>\s]+)', html, re.IGNORECASE):
+            url = m.group(1).strip()
+            # give low default score (we'll still consider)
+            candidates.append((1, url))
 
     if not candidates:
-        # fallback: try to match absolute product pattern anywhere
-        pm = re.search(r'(https?://[^"\'>\s]*chairish\.com/product/[^"\'>\s]+)', html, re.IGNORECASE)
-        if pm:
-            return pm.group(1).strip()
+        # fallback to simpler product-link finder (by href only)
+        pm2 = re.search(r'href=["\'](/product/[^"\']+)["\']', html, re.IGNORECASE)
+        if pm2:
+            return urljoin(base_url, pm2.group(1).strip())
         return None
 
-    # prepare title words (longer words are more informative)
-    words = re.findall(r'\w{4,}', (match_title or "").lower())
-    def score(snippet: str) -> int:
-        s = 0
-        ls = snippet.lower()
-        for w in words:
-            if w in ls:
-                s += 1
-        return s
-
-    scored = [(score(snippet), url) for (url, snippet) in candidates]
-    scored.sort(reverse=True, key=lambda x: x[0])
-    best_score, best_url = scored[0]
-    if best_score > 0:
-        return best_url
-    # no positive score, return first candidate
-    return candidates[0][0]
+    # pick best scoring candidate
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    best_score, best_url = candidates[0]
+    return best_url if best_score >= 1 else None
 
 
 # ==========================================
@@ -760,52 +796,76 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
         if scraped >= max_to_scrape:
             break
 
-        url = (m.get("link") or "").strip()
-        if not url:
+        original_url = (m.get("link") or "").strip()
+        if not original_url:
             continue
 
-        host = _hostname(url)
+        host = _hostname(original_url)
         is_target = any(host.endswith(d) for d in (AUCTION_DOMAINS | RETAIL_DOMAINS))
         if not is_target:
             continue
 
-        m.setdefault("kind", _kind_from_domain(url))
+        m.setdefault("kind", _kind_from_domain(original_url))
         kind = m.get("kind")
 
-        # Use the original match title when attempting to resolve product pages
+        # Use the original match title and thumbnail when attempting to resolve product pages
         match_title = (m.get("title") or "").strip()
+        match_thumbnail = (m.get("thumbnail") or "").strip()
 
-        if url in st.session_state["scrape_cache"]:
-            # cached update may contain an overridden "link" (product_url) already
-            m.update(st.session_state["scrape_cache"][url])
+        cache_key = original_url
+        if cache_key in st.session_state["scrape_cache"]:
+            cached_update = st.session_state["scrape_cache"][cache_key]
+            # If cached_update contains an overridden link/product_url, we should update the match with it
+            m.update(cached_update)
             scraped += 1
             continue
 
-        html, status = _fetch_html(url, session)
+        html, status = _fetch_html(original_url, session)
         update: Dict[str, Any] = {"_http_status": status}
 
         if not html:
-            st.session_state["scrape_cache"][url] = update
+            st.session_state["scrape_cache"][cache_key] = update
             m.update(update)
             scraped += 1
             continue
 
-        # === NEW: For Chairish retail results, prefer the product detail page that best matches the SerpAPI title
+        # === Chairish: attempt image-based product resolution similar to auction flow ===
         if host.endswith("chairish.com"):
-            parsed = urlparse(url)
+            parsed = urlparse(original_url)
             base_url = f"{parsed.scheme}://{parsed.netloc}"
-            # If the SerpAPI-provided link is not a product (collection/search), try to discover a product link that matches match_title
-            if "/product/" not in url:
-                product_url = _find_chairish_product_link(html, match_title, base_url)
+            # If match link isn't a product URL, attempt to resolve best product using image+title
+            if "/product/" not in original_url:
+                product_url = _find_chairish_product_link_by_image(html, match_thumbnail, match_title, base_url)
+                if not product_url:
+                    # fallback to old title-based product link finder
+                    product_url = None
+                    # try the simpler link-by-title approach: search product hrefs and score by title tokens
+                    prod_candidates = []
+                    for href_m in re.finditer(r'href=["\']([^"\']*?/product/[^"\']+)["\']', html, re.IGNORECASE):
+                        href = href_m.group(1).strip()
+                        full = href if href.startswith("http") else urljoin(base_url, href)
+                        start = max(0, href_m.start() - 200)
+                        end = min(len(html), href_m.end() + 200)
+                        snippet = html[start:end]
+                        # scoring by overlap with match_title words
+                        words = re.findall(r'\w{4,}', (match_title or "").lower())
+                        s = 0
+                        for w in words:
+                            if w in snippet.lower():
+                                s += 1
+                        prod_candidates.append((s, full))
+                    if prod_candidates:
+                        prod_candidates.sort(reverse=True, key=lambda x: x[0])
+                        if prod_candidates[0][0] > 0:
+                            product_url = prod_candidates[0][1]
                 if product_url:
                     update["product_url"] = product_url
-                    # overwrite the link that will be used by the UI so "View Listing" points to the product details
                     update["link"] = product_url
             else:
-                # If the provided link already points at a product, keep it but still set product_url for traceability
-                update["product_url"] = url
+                # original link is already a product; store product_url for traceability
+                update["product_url"] = original_url
 
-        # === scrape price/data next ===
+        # === scrape first ===
         if kind == "retail":
             if host.endswith("1stdibs.com"):
                 rp = _extract_1stdibs_price(html)
@@ -819,7 +879,7 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
             # === gemini fallback if missing (and AI Mode on) ===
             if (not update.get("retail_price")) and st.session_state.get("use_gemini", True):
                 text = _clean_html_text(html)
-                ai = _gemini_extract_retail_from_text(text, url)
+                ai = _gemini_extract_retail_from_text(text, original_url)
                 if ai.get("retail_price"):
                     update["retail_price"] = ai["retail_price"]
 
@@ -838,12 +898,13 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
             # === gemini fallback for missing low/high (and AI Mode on) ===
             if (not update.get("auction_low") or not update.get("auction_high")) and st.session_state.get("use_gemini", True):
                 text = _clean_html_text(html)
-                ai = _gemini_extract_auction_from_text(text, url)
+                ai = _gemini_extract_auction_from_text(text, original_url)
                 update["auction_low"] = update.get("auction_low") or ai.get("auction_low")
                 update["auction_high"] = update.get("auction_high") or ai.get("auction_high")
                 update["auction_reserve"] = update.get("auction_reserve") or ai.get("auction_reserve")
 
-        st.session_state["scrape_cache"][url] = update
+        # cache and update
+        st.session_state["scrape_cache"][cache_key] = update
         m.update(update)
         scraped += 1
 
