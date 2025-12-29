@@ -1,3 +1,4 @@
+# Full app.py with Chairish product-link extraction so "View Listing" points to product pages
 import os
 import uuid
 import json
@@ -727,6 +728,25 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
             m.update(update)
             scraped += 1
             continue
+
+        # === NEW: For Chairish retail results, try to find the product detail URL on the page
+        # If we find one, update the stored link to point to the product page (so "View Listing" goes there)
+        if host.endswith("chairish.com"):
+            product_url = None
+            # Prefer absolute product links if present
+            pm = re.search(r'(https?://[^"\'>\s]*chairish\.com/product/[^"\'>\s]+)', html, re.IGNORECASE)
+            if pm:
+                product_url = pm.group(1).strip()
+            else:
+                # Look for relative hrefs like /product/12345/...
+                pm2 = re.search(r'href=["\'](/product/[^"\']+)["\']', html, re.IGNORECASE)
+                if pm2:
+                    parsed = urlparse(url)
+                    product_url = f"{parsed.scheme}://{parsed.netloc}{pm2.group(1).strip()}"
+            if product_url:
+                update["product_url"] = product_url
+                # Overwrite link so UI points to the product page
+                update["link"] = product_url
 
         # === scrape first ===
         if kind == "retail":
