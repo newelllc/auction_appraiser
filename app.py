@@ -1,5 +1,5 @@
-# Full app.py — fixed: restores missing auction extraction functions and adds traceback capture in-app.
-# Keeps Chairish canonical-product + thumbnail heuristics; does not add Pillow.
+# Full app.py — fix: prevent NameError for auction extractor calls by using a single robust helper.
+# Keeps Chairish canonical-product + thumbnail heuristics and in-app traceback capture (debug mode).
 import os
 import uuid
 import json
@@ -340,7 +340,7 @@ def _try_login_liveauctioneers(session: requests.Session) -> bool:
 
 
 # ==========================================
-# 9) Domain extractors (restored auction extractors)
+# 9) Domain extractors (auction and retail helpers)
 # ==========================================
 DOLLAR_RANGE_RE = re.compile(
     r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:-|–|to)\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)',
@@ -422,6 +422,7 @@ def _walk_find_numbers(obj: Any, keys: List[str]) -> List[Decimal]:
     rec(obj)
     return found
 
+# Per-site auction extractor functions used before — keep them but add a generic fallback helper below.
 def _extract_liveauctioneers_estimates(html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     low = None
     high = None
@@ -480,6 +481,31 @@ def _extract_sothebys_christies_estimates(html: str) -> Tuple[Optional[str], Opt
     low, high = _extract_text_estimate_range(text)
     reserve = _extract_reserve_from_text(text)
     return low, high, reserve
+
+# Generic auction estimate helper (used to avoid NameError if a site-specific function is missing)
+def _get_auction_estimates_by_host(host: str, html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Centralized logic to get auction estimates. Tries site-specific extractors first (if host matches),
+    otherwise falls back to text-based extraction. This prevents NameError issues if a specific extractor
+    is not available.
+    """
+    try:
+        if host.endswith("liveauctioneers.com"):
+            return _extract_liveauctioneers_estimates(html)
+        if host.endswith("bidsquare.com"):
+            # Bidsquare may use text or JSON; try its extractor if present
+            return _extract_bidsquare_estimates(html)
+        # default fallback for Sotheby's/Christie's and others
+        return _extract_sothebys_christies_estimates(html)
+    except NameError:
+        # In case a per-site extractor isn't available for some reason, fall back to text-based extraction
+        text = _clean_html_text(html)
+        low, high = _extract_text_estimate_range(text)
+        reserve = _extract_reserve_from_text(text)
+        return low, high, reserve
+    except Exception:
+        # Any unexpected parsing error => return Nones to avoid crashing
+        return None, None, None
 
 
 # ==========================================
@@ -683,7 +709,7 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
                 if debug_chair:
                     st.write("Chairish: original link is canonical product:", original_url)
 
-        # scrape prices/estimates
+        # scrape prices/estimates (use _get_auction_estimates_by_host to avoid NameError)
         try:
             if kind == "retail":
                 if host.endswith("1stdibs.com"):
@@ -701,16 +727,8 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
                         update["retail_price"] = ai["retail_price"]
 
             elif kind == "auction":
-                try:
-                    if host.endswith("liveauctioneers.com"):
-                        low, high, reserve = _extract_liveauctioneers_estimates(html)
-                    elif host.endswith("bidsquare.com"):
-                        low, high, reserve = _extract_bidsquare_estimates(html)
-                    else:
-                        low, high, reserve = _extract_sothebys_christies_estimates(html)
-                except Exception:
-                    low = high = reserve = None
-
+                # use central helper that won't raise NameError
+                low, high, reserve = _get_auction_estimates_by_host(host, html)
                 update["auction_low"] = low
                 update["auction_high"] = high
                 update["auction_reserve"] = reserve
@@ -722,7 +740,7 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
                     update["auction_high"] = update.get("auction_high") or ai.get("auction_high")
                     update["auction_reserve"] = update.get("auction_reserve") or ai.get("auction_reserve")
         except Exception:
-            # prevent any unexpected parsing error from breaking the app
+            # Do not let any parsing error crash the whole app
             pass
 
         st.session_state["scrape_cache"][cache_key] = update
@@ -950,7 +968,7 @@ Return ONLY a comma-separated list.
 
 
 # ==========================================
-# 15) SIDEBAR + MAIN UI
+# 15) SIDEBAR + MAIN UI (traceback capture in-app)
 # ==========================================
 if "content_outputs" not in st.session_state:
     st.session_state["content_outputs"] = {
