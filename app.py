@@ -1,5 +1,8 @@
-# Full app.py — fix: prevent NameError for auction extractor calls by using a single robust helper.
-# Keeps Chairish canonical-product + thumbnail heuristics and in-app traceback capture (debug mode).
+# Full app.py — stable, complete file
+# - Adds in-app traceback capture for debugging
+# - Enrichment uses a safe centralized auction extractor helper to avoid NameError
+# - Chairish product-resolution enforces canonical /product/ prefix and excludes obvious thumbnail image URLs
+# - No Pillow dependency; uses heuristics for thumbnails
 import os
 import uuid
 import json
@@ -340,7 +343,7 @@ def _try_login_liveauctioneers(session: requests.Session) -> bool:
 
 
 # ==========================================
-# 9) Domain extractors (auction and retail helpers)
+# 9) Domain extractors (auction + retail)
 # ==========================================
 DOLLAR_RANGE_RE = re.compile(
     r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:-|–|to)\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)',
@@ -422,7 +425,7 @@ def _walk_find_numbers(obj: Any, keys: List[str]) -> List[Decimal]:
     rec(obj)
     return found
 
-# Per-site auction extractor functions used before — keep them but add a generic fallback helper below.
+# Per-site auction extractors
 def _extract_liveauctioneers_estimates(html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     low = None
     high = None
@@ -459,7 +462,6 @@ def _extract_bidsquare_estimates(html: str) -> Tuple[Optional[str], Optional[str
     reserve = _extract_reserve_from_text(text)
 
     if not low or not high:
-        # scan for numeric keys directly in HTML
         lows = []
         highs = []
         for m in re.finditer(r'"(?:estimate_low|lowEstimate|low_estimate|estimateLow)"\s*:\s*("?)([0-9,]+(?:\.[0-9]{1,2})?)\1', html, re.IGNORECASE):
@@ -482,30 +484,20 @@ def _extract_sothebys_christies_estimates(html: str) -> Tuple[Optional[str], Opt
     reserve = _extract_reserve_from_text(text)
     return low, high, reserve
 
-# Generic auction estimate helper (used to avoid NameError if a site-specific function is missing)
+# Generic helper to avoid NameError from missing per-site extractor
 def _get_auction_estimates_by_host(host: str, html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Centralized logic to get auction estimates. Tries site-specific extractors first (if host matches),
-    otherwise falls back to text-based extraction. This prevents NameError issues if a specific extractor
-    is not available.
-    """
     try:
         if host.endswith("liveauctioneers.com"):
             return _extract_liveauctioneers_estimates(html)
         if host.endswith("bidsquare.com"):
-            # Bidsquare may use text or JSON; try its extractor if present
             return _extract_bidsquare_estimates(html)
-        # default fallback for Sotheby's/Christie's and others
         return _extract_sothebys_christies_estimates(html)
-    except NameError:
-        # In case a per-site extractor isn't available for some reason, fall back to text-based extraction
-        text = _clean_html_text(html)
-        low, high = _extract_text_estimate_range(text)
-        reserve = _extract_reserve_from_text(text)
-        return low, high, reserve
     except Exception:
-        # Any unexpected parsing error => return Nones to avoid crashing
-        return None, None, None
+        # fallback to text-based extraction
+        text = _clean_html_text(html)
+        lo, hi = _extract_text_estimate_range(text)
+        reserve = _extract_reserve_from_text(text)
+        return lo, hi, reserve
 
 
 # ==========================================
@@ -547,7 +539,7 @@ TEXT:
 
 
 # ==========================================
-# 11) Enrichment with scrape + Chairish improvements (canonical product requirement & thumbnail heuristics)
+# 11) Enrichment with scrape + Chairish improvements
 # ==========================================
 def _is_likely_thumbnail_url(img_url: str) -> bool:
     if not img_url:
@@ -622,6 +614,138 @@ def _find_chairish_product_link_by_image(html: str, match_thumbnail: Optional[st
     if best_score >= 1 and best_url.startswith(canonical_prefix):
         return best_url
     return None
+
+def _extract_1stdibs_price(html: str) -> Optional[str]:
+    candidates: List[Decimal] = []
+    blocks = _parse_jsonld_blocks(html)
+    candidates.extend(_jsonld_offer_prices_usd(blocks))
+
+    for m in re.finditer(
+        r'"price"\s*:\s*"?([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)"?'
+        r'.{0,240}?"(?:priceCurrency|currency|currencyCode)"\s*:\s*"?USD"?',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        d = _to_decimal_money(m.group(1))
+        if d is not None:
+            candidates.append(d)
+
+    meta = _extract_meta_map(html)
+    for k in ("product:price:amount", "og:price:amount", "twitter:data1", "og:description", "og:title"):
+        if k in meta:
+            d = _to_decimal_money(meta[k])
+            if d is not None:
+                candidates.append(d)
+
+    plausible = [c for c in candidates if Decimal("10") <= c <= Decimal("2000000")]
+    if not plausible:
+        return None
+    return _sanitize_money(min(plausible))
+
+def _extract_chairish_price(html: str) -> Optional[str]:
+    blocks = _parse_jsonld_blocks(html)
+    prices = _jsonld_offer_prices_usd(blocks)
+    plausible = [p for p in prices if Decimal("10") <= p <= Decimal("2000000")]
+    if plausible:
+        return _sanitize_money(min(plausible))
+
+    cents = []
+    for m in CENTS_RE.finditer(html):
+        try:
+            cents.append(int(m.group(1)))
+        except Exception:
+            continue
+        if len(cents) >= 25:
+            break
+    cents_plaus = [c for c in cents if c >= 1000]
+    if cents_plaus:
+        return _sanitize_money(Decimal(min(cents_plaus)) / Decimal(100))
+
+    meta = _extract_meta_map(html)
+    for mk in ("og:title", "og:description", "twitter:title", "twitter:description", "description"):
+        if mk in meta:
+            mm = re.search(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', meta[mk])
+            if mm:
+                p = _sanitize_money(mm.group(1))
+                if p:
+                    return p
+
+    text = _clean_html_text(html)
+    idx = text.lower().find("price")
+    window = text[max(0, idx - 12000): idx + 18000] if idx != -1 else text[:250000]
+    mm2 = re.search(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', window)
+    if mm2:
+        return _sanitize_money(mm2.group(1))
+    return None
+
+def _extract_retail_price_generic(html: str) -> Optional[str]:
+    blocks = _parse_jsonld_blocks(html)
+    prices = _jsonld_offer_prices_usd(blocks)
+    plausible = [p for p in prices if Decimal("10") <= p <= Decimal("2000000")]
+    if plausible:
+        return _sanitize_money(min(plausible))
+
+    meta = _extract_meta_map(html)
+    for mk in ("product:price:amount", "og:price:amount", "og:title", "og:description"):
+        if mk in meta:
+            p = _sanitize_money(meta[mk])
+            if p:
+                return p
+
+    text = _clean_html_text(html)
+    idx = text.lower().find("price")
+    window = text[max(0, idx - 12000): idx + 18000] if idx != -1 else text[:250000]
+    mm = re.search(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', window)
+    if mm:
+        return _sanitize_money(mm.group(1))
+    return None
+
+def _parse_jsonld_blocks(html: str) -> List[Any]:
+    blocks: List[Any] = []
+    for m in JSONLD_RE.finditer(html):
+        raw = (m.group(1) or "").strip().strip("<!--").strip("-->")
+        if not raw:
+            continue
+        try:
+            blocks.append(json.loads(raw))
+        except Exception:
+            continue
+    return blocks
+
+def _extract_meta_map(html: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for m in META_CONTENT_RE.finditer(html):
+        k = (m.group(1) or "").strip().lower()
+        v = (m.group(2) or "").strip()
+        if k and v:
+            out[k] = v
+    return out
+
+def _jsonld_offer_prices_usd(blocks: List[Any]) -> List[Decimal]:
+    out: List[Decimal] = []
+
+    def rec(x: Any):
+        if isinstance(x, dict):
+            t = str(x.get("@type", "")).lower()
+            if "offer" in t:
+                cur = (x.get("priceCurrency") or x.get("currency") or "").strip()
+                price = x.get("price") or x.get("lowPrice") or x.get("highPrice")
+                if cur.upper() == "USD" and price is not None:
+                    d = _to_decimal_money(price)
+                    if d is not None:
+                        out.append(d)
+            if "offers" in x:
+                rec(x["offers"])
+            for v in x.values():
+                rec(v)
+        elif isinstance(x, list):
+            for it in x:
+                rec(it)
+
+    for b in blocks:
+        rec(b)
+    return out
+
 
 def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> list[dict]:
     if "scrape_cache" not in st.session_state:
@@ -709,7 +833,7 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
                 if debug_chair:
                     st.write("Chairish: original link is canonical product:", original_url)
 
-        # scrape prices/estimates (use _get_auction_estimates_by_host to avoid NameError)
+        # scrape prices/estimates (use centralized auction helper)
         try:
             if kind == "retail":
                 if host.endswith("1stdibs.com"):
@@ -727,7 +851,6 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
                         update["retail_price"] = ai["retail_price"]
 
             elif kind == "auction":
-                # use central helper that won't raise NameError
                 low, high, reserve = _get_auction_estimates_by_host(host, html)
                 update["auction_low"] = low
                 update["auction_high"] = high
@@ -751,7 +874,7 @@ def enrich_matches_with_prices(matches: list[dict], max_to_scrape: int = 10) -> 
 
 
 # ==========================================
-# 12) GOOGLE SHEETS EXPORT (unchanged schema)
+# 12) GOOGLE SHEETS EXPORT (unchanged)
 # ==========================================
 def export_to_google_sheets(results: dict):
     sheet_id = _get_secret("GOOGLE_SHEET_ID")
@@ -968,7 +1091,7 @@ Return ONLY a comma-separated list.
 
 
 # ==========================================
-# 15) SIDEBAR + MAIN UI (traceback capture in-app)
+# 15) SIDEBAR + MAIN UI (with in-app traceback capture)
 # ==========================================
 if "content_outputs" not in st.session_state:
     st.session_state["content_outputs"] = {
@@ -1007,7 +1130,6 @@ st.header("2. Run Appraisal")
 run = st.button("Run Appraisal", disabled=not uploaded_file)
 
 if run:
-    # Wrap the entire processing in try/except and display full traceback in-app for debugging
     with st.spinner("Processing..."):
         try:
             s3 = boto3.client(
@@ -1051,20 +1173,17 @@ if run:
                 m["kind"] = _kind_from_domain(m.get("link") or "")
                 m.setdefault("confidence", 0.75 if m["kind"] in ("auction", "retail") else 0.35)
 
-            # Only attempt scraping/enrichment if enabled; guard against exceptions so app doesn't crash
             if st.session_state.get("use_scrape_prices", True):
                 try:
                     raw_matches = enrich_matches_with_prices(
                         raw_matches,
                         max_to_scrape=int(st.session_state.get("max_scrape_links", 10)),
                     )
-                except Exception as e:
-                    # capture and show traceback in-app
+                except Exception:
                     tb = traceback.format_exc()
                     st.error("Error during enrich_matches_with_prices — full traceback follows below.")
                     st.code(tb)
-                    # preserve raw_matches as-is so UI can still show SerpAPI results
-            # save results
+
             st.session_state["results"] = {
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "traceability": {
@@ -1082,12 +1201,10 @@ if run:
                 "keywords": "",
             }
 
-        except Exception as e:
+        except Exception:
             tb = traceback.format_exc()
-            # Show clear UI feedback + full traceback for debugging
             st.error("An unexpected error occurred while running the appraisal. Full traceback:")
             st.code(tb)
-            # Also store in session for later inspection
             st.session_state["last_run_traceback"] = tb
 
 st.header("3. Results")
